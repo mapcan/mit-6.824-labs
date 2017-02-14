@@ -42,15 +42,18 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		}
 		go func() {
 			var worker string
-			select {
-			case worker = <-registerChan:
-			case worker = <-workers:
-			}
-			ok := call(worker, "Worker.DoTask", task, new(struct{}))
-			if ok {
-				workers <- worker
-			} else {
-				log.Printf("Job %s phase %v task %d error\n", jobName, phase, n)
+			ok := false
+			for !ok {
+				select {
+				case worker = <-registerChan:
+				case worker = <-workers:
+				}
+				ok = call(worker, "Worker.DoTask", task, new(struct{}))
+				if ok {
+					workers <- worker
+				} else {
+					log.Printf("Job %s phase %v task %d error\n", jobName, phase, n)
+				}
 			}
 			wait <- 1
 		}()
