@@ -22,7 +22,7 @@ import "sync"
 import "math/rand"
 import "time"
 
-import "fmt"
+//import "fmt"
 
 // import "bytes"
 // import "encoding/gob"
@@ -284,6 +284,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}()
 	}
 
+	//fmt.Printf("Server: %d, log: %v\n", rf.me, rf.log)
+
 	reply.Success = true
 }
 
@@ -344,7 +346,7 @@ func (rf *Raft) makeAppendEntries(server int, args *AppendEntriesArgs) bool {
 	args.LeaderId = rf.me
 	args.PrevLogIndex = prevLogIndex
 	args.PrevLogTerm = prevLogTerm
-	fmt.Printf("prevLogIndex: %d, prevLogTerm: %d, log: %v\n", prevLogIndex, prevLogTerm, rf.log)
+	//fmt.Printf("prevLogIndex: %d, prevLogTerm: %d, log: %v\n", prevLogIndex, prevLogTerm, rf.log)
 	args.Entries = rf.log[rf.nextIndex[server]:len(rf.log)]
 	args.LeaderCommit = rf.commitIndex
 	return true
@@ -359,11 +361,10 @@ func (rf *Raft) applyLogEntries() {
 			if rf.commitIndex > rf.lastApplied {
 				rf.lastApplied++
 				msg := ApplyMsg{
-					Index:   rf.lastApplied,
+					Index:   rf.lastApplied + 1,
 					Command: rf.log[rf.lastApplied].Command,
 				}
 				go func(msg ApplyMsg) {
-					//fmt.Printf("ApplyMsg: %v\n", msg)
 					rf.applyCh <- msg
 				}(msg)
 			}
@@ -398,7 +399,7 @@ func (rf *Raft) replicateLogEntriesToServer(server int, repCh chan int) {
 								m++
 							}
 						}
-						if m >= len(rf.matchIndex)/2 {
+						if m > len(rf.matchIndex)/2 {
 							//fmt.Printf("m = %d, majority: %d\n", m, len(rf.matchIndex)/2)
 							rf.commitIndex = n
 							go func() {
@@ -433,32 +434,12 @@ func (rf *Raft) leaderWorker() {
 
 	for {
 		select {
-		//case term = <-rf.becomeLeaderCh:
-		//	rf.heartbeat()
-		//	//fmt.Printf("Server: %d become leader, term: %d\n", rf.me, term)
 		case <-rf.replicateCh:
-			//case <-time.After(time.Millisecond * 200):
-			//	rf.mu.Lock()
-			//	currentState := rf.role
-			//	rf.mu.Unlock()
-			//	if currentState != Leader {
-			//		continue
-			//	}
-
 			for i, repCh := range repChs {
 				go func(ch chan int) {
 					ch <- i
 				}(repCh)
 			}
-			//	rf.mu.Lock()
-			//	currentTerm := rf.term
-			//	currentState := rf.role
-			//	rf.mu.Unlock()
-			//	if currentTerm != term || currentState != Leader {
-			//		continue
-			//	}
-			//	fmt.Printf("Server: %d send heartbeat, term: %d, currentTerm: %d, currentState: %d\n", rf.me, term, currentTerm, currentState)
-			//	rf.heartbeat()
 		}
 	}
 }
