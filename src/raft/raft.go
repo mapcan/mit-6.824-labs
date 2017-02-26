@@ -164,6 +164,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	//fmt.Printf("Server %d term: %d received RequestVoteArgs: %v, log: %v\n", rf.me, rf.term, args, rf.log)
 	if args.Term > rf.term {
 		rf.term = args.Term
 		rf.role = Follower
@@ -176,9 +177,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 		}
 		if lastLogIndex >= 0 {
-			if lastLogIndex == args.LastLogIndex && rf.log[lastLogIndex].Term < args.LastLogTerm {
+			if rf.log[lastLogIndex].Term <= args.LastLogTerm {
 				reply.VoteGranted = true
-			} else if rf.log[lastLogIndex].Term == args.Term && lastLogIndex < args.LastLogIndex {
+			} else if rf.log[lastLogIndex].Term == args.Term && lastLogIndex <= args.LastLogIndex {
 				reply.VoteGranted = true
 			}
 		}
@@ -324,7 +325,36 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	//if len(args.Entries) > 0 {
+	//fmt.Printf("Server %d sending entries to follower %d, %v\n", rf.me, server, args)
+	//}
+
+	var ok bool
+	termUpdated := false
+	for {
+		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		if !ok {
+			continue
+		}
+		rf.mu.Lock()
+		if reply.Term > rf.term {
+			rf.term = reply.Term
+			rf.role = Follower
+			termUpdated = true
+			//fmt.Printf("Leader %d change state to Follower, currentTerm: %d\n", rf.me, rf.term)
+		}
+		rf.mu.Unlock()
+		if ok || termUpdated {
+			if termUpdated {
+				//fmt.Printf("Leader %d change state to Follower, currentTerm: %d, reply: %v\n", rf.me, rf.term, reply)
+			}
+			break
+		}
+	}
+
+	//if len(args.Entries) > 0 {
+	//fmt.Printf("Server %d sent entries to follower %d, %v, ok: %v, reply: %v\n", rf.me, server, args, ok, reply)
+	//}
 	return ok
 }
 
@@ -346,7 +376,7 @@ func (rf *Raft) makeAppendEntries(server int, args *AppendEntriesArgs) bool {
 	args.LeaderId = rf.me
 	args.PrevLogIndex = prevLogIndex
 	args.PrevLogTerm = prevLogTerm
-	//fmt.Printf("prevLogIndex: %d, prevLogTerm: %d, log: %v\n", prevLogIndex, prevLogTerm, rf.log)
+	//fmt.Printf("Leader %d to Follower %d, prevLogIndex: %d, prevLogTerm: %d, log: %v\n", rf.me, server, prevLogIndex, prevLogTerm, rf.log)
 	args.Entries = rf.log[rf.nextIndex[server]:len(rf.log)]
 	args.LeaderCommit = rf.commitIndex
 	return true
@@ -356,17 +386,17 @@ func (rf *Raft) applyLogEntries() {
 	for {
 		select {
 		case <-rf.applyEntriesCh:
+		case <-time.After(time.Second):
 			rf.mu.Lock()
 
-			if rf.commitIndex > rf.lastApplied {
+			for rf.commitIndex > rf.lastApplied {
 				rf.lastApplied++
 				msg := ApplyMsg{
 					Index:   rf.lastApplied + 1,
 					Command: rf.log[rf.lastApplied].Command,
 				}
-				go func(msg ApplyMsg) {
-					rf.applyCh <- msg
-				}(msg)
+				//fmt.Printf("Server: %d ApplyMsg: %v\n", rf.me, msg)
+				rf.applyCh <- msg
 			}
 
 			rf.mu.Unlock()
@@ -374,46 +404,62 @@ func (rf *Raft) applyLogEntries() {
 	}
 }
 
-func (rf *Raft) replicateLogEntriesToServer(server int, repCh chan int) {
+func (rf *Raft) replicateLogEntriesToServer(server int, repCh chan int, term int) {
 	//fmt.Printf("server: %d role: %d, gorouting %d waiting on %v\n", rf.me, rf.role, server, repCh)
+	terminate := false
+	select {
+	case <-repCh:
+	}
 	for {
-		select {
-		case <-repCh:
-			//fmt.Printf("server: %d, role: %d, AppendEntries To Server: %d\n", rf.me, rf.role, server)
-			var args AppendEntriesArgs
-			var reply AppendEntriesReply
-			if !rf.makeAppendEntries(server, &args) {
-				continue
-			}
-			rf.sendAppendEntries(server, &args, &reply)
-			if reply.Success {
-				rf.mu.Lock()
-				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
-				//fmt.Printf("server: %d, role: %d, rf.nextIndex[%d]: %d, rf.matchIndex[%d]: %d\n", rf.me, rf.role, server, rf.nextIndex[server], server, rf.matchIndex[server])
-				for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
-					if rf.log[n].Term == rf.term {
-						m := 0
-						for _, i := range rf.matchIndex {
-							if i >= n {
-								m++
-							}
-						}
-						if m > len(rf.matchIndex)/2 {
-							//fmt.Printf("m = %d, majority: %d\n", m, len(rf.matchIndex)/2)
-							rf.commitIndex = n
-							go func() {
-								rf.applyEntriesCh <- 1
-							}()
+		//fmt.Printf("server: %d, role: %d, AppendEntries To Server: %d\n", rf.me, rf.role, server)
+		rf.mu.Lock()
+		if rf.term != term || rf.role != Leader {
+			terminate = true
+		}
+		rf.mu.Unlock()
+		if terminate {
+			return
+		}
+		var args AppendEntriesArgs
+		var reply AppendEntriesReply
+		if !rf.makeAppendEntries(server, &args) {
+			continue
+		}
+		rf.sendAppendEntries(server, &args, &reply)
+		if reply.Success {
+			rf.mu.Lock()
+			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
+			//fmt.Printf("server: %d, role: %d, rf.nextIndex[%d]: %d, rf.matchIndex[%d]: %d\n", rf.me, rf.role, server, rf.nextIndex[server], server, rf.matchIndex[server])
+			for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
+				if rf.log[n].Term == rf.term {
+					m := 0
+					for _, i := range rf.matchIndex {
+						if i >= n {
+							m++
 						}
 					}
+					if m == len(rf.matchIndex)/2+1 {
+						//fmt.Printf("m = %d, majority: %d\n", m, len(rf.matchIndex)/2)
+						rf.commitIndex = n
+						go func() {
+							rf.applyEntriesCh <- 1
+						}()
+					}
 				}
-				rf.mu.Unlock()
-			} else {
-				rf.mu.Lock()
-				rf.nextIndex[server]--
-				rf.mu.Unlock()
 			}
+			rf.mu.Unlock()
+		} else {
+			rf.mu.Lock()
+			if rf.nextIndex[server] >= 0 {
+				rf.nextIndex[server]--
+			}
+			rf.mu.Unlock()
+			continue
+		}
+		select {
+		case <-repCh:
+		case <-time.After(time.Millisecond * 200):
 		}
 	}
 }
@@ -426,7 +472,7 @@ func (rf *Raft) leaderWorker() {
 		if i != rf.me {
 			ch := make(chan int)
 			repChs = append(repChs, ch)
-			go rf.replicateLogEntriesToServer(i, ch)
+			go rf.replicateLogEntriesToServer(i, ch, rf.term)
 		}
 	}
 	//fmt.Printf("Server: %d, initial term: %d, role: %v\n", rf.me, term, rf.role)
@@ -435,6 +481,7 @@ func (rf *Raft) leaderWorker() {
 	for {
 		select {
 		case <-rf.replicateCh:
+		case <-time.After(time.Millisecond * 200):
 			for i, repCh := range repChs {
 				go func(ch chan int) {
 					ch <- i
@@ -511,6 +558,7 @@ func (rf *Raft) vote() {
 	rf.term++
 	rf.votedFor = rf.me
 	rf.granted = 0
+	//fmt.Printf("Server %d vote, term: %d\n", rf.me, rf.term)
 
 	for i, _ := range rf.peers {
 		if i == rf.me {
@@ -535,6 +583,7 @@ func (rf *Raft) vote() {
 		go func() {
 			var reply RequestVoteReply
 			rf.sendRequestVote(server, &args, &reply)
+			//fmt.Printf("Server %d vote, term: %d, peer: %d, voteReply: %v\n", rf.me, rf.term, server, reply)
 			if !reply.VoteGranted {
 				return
 			}
@@ -543,21 +592,19 @@ func (rf *Raft) vote() {
 			defer rf.mu.Unlock()
 
 			rf.granted++
-			if rf.granted >= len(rf.peers)/2+1 {
+			if rf.granted == len(rf.peers)/2+1 {
 				//fmt.Printf("Server: %d, Granted: %d\n", rf.me, rf.granted)
 				rf.role = Leader
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
 				for i := 0; i < len(rf.peers); i++ {
 					rf.matchIndex[i] = -1
-					if i == rf.me {
-						rf.nextIndex[i] = -1
-					} else {
-						rf.nextIndex[i] = len(rf.log)
-					}
+					rf.nextIndex[i] = len(rf.log)
 				}
 				//rf.becomeLeaderCh <- 1
+				//fmt.Printf("Server %d become Leader\n", rf.me)
 				go rf.heartbeat()
+				go rf.leaderWorker()
 				go func(term int) {
 					ticker := time.NewTicker(110 * time.Millisecond)
 					for range ticker.C {
@@ -566,7 +613,7 @@ func (rf *Raft) vote() {
 						currentState := rf.role
 						rf.mu.Unlock()
 						if currentTerm != term || currentState != Leader {
-							break
+							return
 						}
 						rf.heartbeat()
 					}
@@ -624,8 +671,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.CheckHeartbeat()
-	go rf.leaderWorker()
 	go rf.applyLogEntries()
+
+	//fmt.Printf("%d peers\n", len(rf.peers))
 
 	return rf
 }
