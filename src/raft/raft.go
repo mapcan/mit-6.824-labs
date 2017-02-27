@@ -80,6 +80,7 @@ type Raft struct {
 	heartbeatCh    chan int
 	applyEntriesCh chan int
 	granted        int
+	killed         bool
 }
 
 // return currentTerm and whether this server
@@ -170,7 +171,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	//fmt.Printf("Server %d term: %d received RequestVoteArgs: %v, log: %v\n", rf.me, rf.term, args, rf.log)
+	fmt.Printf("Server %d term: %d received RequestVoteArgs: %v, log: %v\n", rf.me, rf.term, args, rf.log)
 	if args.Term > rf.term {
 		rf.term = args.Term
 		rf.role = Follower
@@ -181,11 +182,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		if lastLogIndex < 0 && lastLogIndex == args.LastLogIndex {
 			reply.VoteGranted = true
+			return
 		}
 		if lastLogIndex >= 0 {
-			if rf.log[lastLogIndex].Term <= args.LastLogTerm {
+			if rf.log[lastLogIndex].Term < args.LastLogTerm {
 				reply.VoteGranted = true
-			} else if rf.log[lastLogIndex].Term == args.Term && lastLogIndex <= args.LastLogIndex {
+			} else if rf.log[lastLogIndex].Term == args.LastLogTerm && lastLogIndex <= args.LastLogIndex {
 				reply.VoteGranted = true
 			}
 		}
@@ -332,9 +334,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	//if len(args.Entries) > 0 {
-	//fmt.Printf("Server %d sending entries to follower %d, %v\n", rf.me, server, args)
-	//}
+	if len(args.Entries) > 0 {
+		fmt.Printf("Server %d sending entries to follower %d, %v\n", rf.me, server, args)
+	}
 
 	var ok bool
 	termUpdated := false
@@ -359,9 +361,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		}
 	}
 
-	//if len(args.Entries) > 0 {
-	//fmt.Printf("Server %d sent entries to follower %d, %v, ok: %v, reply: %v\n", rf.me, server, args, ok, reply)
-	//}
+	if len(args.Entries) > 0 {
+		fmt.Printf("Server %d sent entries to follower %d, %v, ok: %v, reply: %v\n", rf.me, server, args, ok, reply)
+	}
 	return ok
 }
 
@@ -402,7 +404,7 @@ func (rf *Raft) applyLogEntries() {
 					Index:   rf.lastApplied + 1,
 					Command: rf.log[rf.lastApplied].Command,
 				}
-				fmt.Printf("Server: %d ApplyMsg: %v\n", rf.me, msg)
+				fmt.Printf("Server: %d ApplyMsg: %v, logs %v\n", rf.me, msg, rf.log)
 				rf.applyCh <- msg
 			}
 
@@ -412,7 +414,7 @@ func (rf *Raft) applyLogEntries() {
 }
 
 func (rf *Raft) replicateLogEntriesToServer(server int, repCh chan int, term int) {
-	//fmt.Printf("server: %d role: %d, gorouting %d waiting on %v\n", rf.me, rf.role, server, repCh)
+	fmt.Printf("server: %d role: %d, gorouting %d waiting on %v\n", rf.me, rf.role, server, repCh)
 	terminate := false
 	select {
 	case <-repCh:
@@ -553,6 +555,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.killed = true
 }
 
 func (rf *Raft) vote() {
@@ -611,7 +614,7 @@ func (rf *Raft) vote() {
 					rf.nextIndex[i] = len(rf.log)
 				}
 				//rf.becomeLeaderCh <- 1
-				//fmt.Printf("Server %d become Leader\n", rf.me)
+				fmt.Printf("Server %d become Leader\n", rf.me)
 				go rf.heartbeat()
 				go rf.leaderWorker()
 				go func(term int) {
@@ -676,9 +679,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyEntriesCh = make(chan int)
 	rf.replicateCh = make(chan int)
 	rf.granted = 0
+	rf.killed = false
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	fmt.Printf("Server %d term: %d, votedFor: %d, logs: %v\n", rf.me, rf.term, rf.votedFor, rf.log)
 	go rf.CheckHeartbeat()
 	go rf.applyLogEntries()
 
