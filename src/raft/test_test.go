@@ -670,8 +670,10 @@ func TestFigure82C(t *testing.T) {
 		}
 
 		if nup < 3 {
+			DPrintf("Less than 3 servers: %v\n", cfg.rafts)
 			s := rand.Int() % servers
 			if cfg.rafts[s] == nil {
+				DPrintf("Start a new server: %d\n", s)
 				cfg.start1(s)
 				cfg.connect(s)
 				nup += 1
@@ -681,6 +683,7 @@ func TestFigure82C(t *testing.T) {
 
 	for i := 0; i < servers; i++ {
 		if cfg.rafts[i] == nil {
+			DPrintf("Again start new server: %d, server: %v\n", i, cfg.rafts)
 			cfg.start1(i)
 			cfg.connect(i)
 		}

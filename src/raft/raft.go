@@ -419,7 +419,6 @@ func (rf *Raft) makeAppendEntries(server int, args *AppendEntriesArgs) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	//fmt.Printf("server: %d, peer: %d, nextIndex: %v\n", rf.me, server, rf.nextIndex)
 	if len(rf.log)-1 < rf.nextIndex[server] {
 		return false
 	}
@@ -433,7 +432,6 @@ func (rf *Raft) makeAppendEntries(server int, args *AppendEntriesArgs) bool {
 	args.LeaderId = rf.me
 	args.PrevLogIndex = prevLogIndex
 	args.PrevLogTerm = prevLogTerm
-	//fmt.Printf("Leader %d to Follower %d, prevLogIndex: %d, prevLogTerm: %d, log: %v\n", rf.me, server, prevLogIndex, prevLogTerm, rf.log)
 	args.Entries = rf.log[rf.nextIndex[server]:len(rf.log)]
 	args.LeaderCommit = rf.commitIndex
 	return true
@@ -453,7 +451,6 @@ func (rf *Raft) applyLogEntries() {
 				Index:   rf.lastApplied + 1,
 				Command: rf.log[rf.lastApplied].Command,
 			}
-			//fmt.Printf("Server: %d ApplyMsg: %v, logs %v\n", rf.me, msg, rf.log)
 			rf.applyCh <- msg
 		}
 
@@ -536,7 +533,6 @@ func (rf *Raft) leaderWorker() {
 			go rf.replicateLogEntriesToServer(i, ch, rf.term)
 		}
 	}
-	//fmt.Printf("Server: %d, initial term: %d, role: %v\n", rf.me, term, rf.role)
 	rf.mu.Unlock()
 
 	for {
@@ -630,7 +626,6 @@ func (rf *Raft) vote() {
 	rf.term++
 	rf.votedFor = rf.me
 	rf.granted = 0
-	//fmt.Printf("Server %d vote, term: %d\n", rf.me, rf.term)
 
 	for i, _ := range rf.peers {
 		if i == rf.me {
@@ -678,7 +673,6 @@ func (rf *Raft) vote() {
 					rf.nextIndex[i] = len(rf.log)
 				}
 				//rf.becomeLeaderCh <- 1
-				//fmt.Printf("Server %d become Leader\n", rf.me)
 				go rf.heartbeat()
 				go rf.leaderWorker()
 				go func(term int) {
@@ -753,8 +747,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("Server %d Started term: %d, votedFor: %d, logs: %v\n", rf.me, rf.term, rf.votedFor, rf.log)
 	go rf.CheckHeartbeat()
 	go rf.applyLogEntries()
-
-	//fmt.Printf("%d peers\n", len(rf.peers))
 
 	return rf
 }
