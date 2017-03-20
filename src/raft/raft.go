@@ -22,7 +22,7 @@ import "sync"
 import "math/rand"
 import "time"
 
-//import "fmt"
+import "fmt"
 
 import "bytes"
 import "encoding/gob"
@@ -53,6 +53,7 @@ const (
 
 type Log struct {
 	Term    int
+	Index   int
 	Command interface{}
 }
 
@@ -81,6 +82,29 @@ type Raft struct {
 	applyEntriesCh chan int
 	granted        int
 	killed         bool
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.term
+	if args.Term < rf.term {
+		return
+	}
 }
 
 // return currentTerm and whether this server
@@ -300,32 +324,59 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	prevLogIndex := args.PrevLogIndex
 	prevLogTerm := args.PrevLogTerm
 	logLen := len(rf.log)
+	if logLen > 0 {
+		logLen = rf.log[logLen-1].Index + 1
+	}
 
 	if prevLogIndex > logLen-1 {
 		reply.Index = logLen
 		return
 	}
 
-	if prevLogIndex > -1 && rf.log[prevLogIndex].Term != prevLogTerm {
-		for i := prevLogIndex; i > 0; i-- {
-			if rf.log[i].Term != rf.log[i-1].Term {
-				reply.Index = i - 1
-			}
-		}
-		return
+	base := 0
+	if len(rf.log) > 0 {
+		base = rf.log[0].Index
 	}
+	if prevLogIndex > base {
+		term := rf.log[prevLogIndex-base].Term
+		if term != prevLogTerm {
+			for i := prevLogIndex - 1; i > base; i-- {
+				if rf.log[i-base].Term != term {
+					reply.Index = i + 1
+					break
+				}
+			}
+			return
+		}
+	}
+	//if prevLogIndex > -1 && rf.log[prevLogIndex].Term != prevLogTerm {
+	//	for i := prevLogIndex; i > 0; i-- {
+	//		if rf.log[i].Term != rf.log[i-1].Term {
+	//			reply.Index = i - 1
+	//		}
+	//	}
+	//	return
+	//}
 
 	DPrintf("Server: %d, BeforeAppend commit: %d, args: %v, log: %v\n", rf.me, rf.commitIndex, args, rf.log)
-
 	var i, j int
-	for i, j = args.PrevLogIndex+1, 0; i < logLen && j < len(args.Entries); i, j = i+1, j+1 {
-		if rf.log[i].Term != args.Entries[j].Term {
+	for i, j = prevLogIndex-base+1, 0; i >= 0 && i < logLen && j < len(args.Entries); i, j = i+1, j+1 {
+		if rf.log[i-base].Term != args.Entries[j].Term {
 			break
 		}
 	}
+	//var i, j int
+	//for i, j = args.PrevLogIndex+1, 0; i < logLen && j < len(args.Entries); i, j = i+1, j+1 {
+	//	if rf.log[i].Term != args.Entries[j].Term {
+	//		break
+	//	}
+	//}
 	if i < logLen && j < len(args.Entries) {
-		rf.log = rf.log[:i]
+		rf.log = rf.log[:i-base]
 	}
+	//if i < logLen && j < len(args.Entries) {
+	//	rf.log = rf.log[:i]
+	//}
 	if j < len(args.Entries) {
 		for _, entry := range args.Entries[j:] {
 			rf.log = append(rf.log, entry)
@@ -419,20 +470,24 @@ func (rf *Raft) makeAppendEntries(server int, args *AppendEntriesArgs) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if len(rf.log)-1 < rf.nextIndex[server] {
+	if len(rf.log) == 0 {
+		return false
+	}
+	base := rf.log[0].Index
+	if base+len(rf.log)-1 < rf.nextIndex[server] {
 		return false
 	}
 
 	prevLogIndex := rf.nextIndex[server] - 1
 	prevLogTerm := -1
 	if prevLogIndex > -1 {
-		prevLogTerm = rf.log[prevLogIndex].Term
+		prevLogTerm = rf.log[prevLogIndex-base].Term
 	}
 	args.Term = rf.term
 	args.LeaderId = rf.me
 	args.PrevLogIndex = prevLogIndex
 	args.PrevLogTerm = prevLogTerm
-	args.Entries = rf.log[rf.nextIndex[server]:len(rf.log)]
+	args.Entries = rf.log[prevLogIndex-base+1 : len(rf.log)]
 	args.LeaderCommit = rf.commitIndex
 	return true
 }
@@ -585,10 +640,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	log := Log{
 		Term:    rf.term,
+		Index:   0,
 		Command: command,
 	}
 	rf.log = append(rf.log, log)
 	index = len(rf.log)
+	rf.log[index-1].Index = index - 1
 	rf.nextIndex[rf.me] = len(rf.log)
 	rf.matchIndex[rf.me] = len(rf.log) - 1
 
@@ -665,6 +722,7 @@ func (rf *Raft) vote() {
 			rf.granted++
 			if rf.granted == len(rf.peers)/2+1 {
 				DPrintf("Server: %d, Granted: %d\n", rf.me, rf.granted)
+				fmt.Printf("Server: %d, Granted: %d\n", rf.me, rf.granted)
 				rf.role = Leader
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
