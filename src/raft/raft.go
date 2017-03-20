@@ -643,9 +643,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   0,
 		Command: command,
 	}
+
+	logLen := len(rf.log)
+	if logLen > 0 {
+		log.Index = rf.log[logLen-1].Index + 1
+	}
 	rf.log = append(rf.log, log)
-	index = len(rf.log)
-	rf.log[index-1].Index = index - 1
+	index = log.Index + 1
 	rf.nextIndex[rf.me] = len(rf.log)
 	rf.matchIndex[rf.me] = len(rf.log) - 1
 
