@@ -1,7 +1,9 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
+	//"fmt"
 	"labrpc"
 	"log"
 	"raft"
@@ -40,7 +42,7 @@ type RaftKV struct {
 	// Your definitions here.
 	database     map[string]string
 	done         map[string]int64
-	notifyCommit map[int]chan int
+	notifyCommit map[int]chan Op
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
@@ -82,14 +84,17 @@ func (kv *RaftKV) appendLog(cmd Op) bool {
 	kv.mu.Lock()
 	ch, ok := kv.notifyCommit[index]
 	if !ok {
-		ch = make(chan int, 1)
+		ch = make(chan Op, 1)
 		kv.notifyCommit[index] = ch
 	}
 	kv.mu.Unlock()
 
 	select {
-	case commitIndex := <-ch:
-		return commitIndex == index
+	case op := <-ch:
+		kv.mu.Lock()
+		delete(kv.notifyCommit, index)
+		kv.mu.Unlock()
+		return cmd == op
 	case <-time.After(1000 * time.Millisecond):
 		return false
 	}
@@ -141,6 +146,7 @@ func (kv *RaftKV) apply(cmd Op) {
 	case "Put":
 		kv.database[cmd.Key] = cmd.Value
 	case "Append":
+		//fmt.Printf("Append Key: %s, Value: %s\n", cmd.Key, cmd.Value)
 		kv.database[cmd.Key] += cmd.Value
 	}
 	kv.done[cmd.ClientID] = cmd.Sequence
@@ -158,7 +164,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.done = make(map[string]int64)
 	kv.database = make(map[string]string)
-	kv.notifyCommit = make(map[int]chan int)
+	kv.notifyCommit = make(map[int]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -168,17 +174,42 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			msg := <-kv.applyCh
 			DPrintf("Server %d, ApplyMsg: %v", kv.me, msg)
-			op := msg.Command.(Op)
-			kv.mu.Lock()
-			if !kv.detectDuplicate(op.ClientID, op.Sequence) {
-				kv.apply(op)
+			if msg.UseSnapshot {
+				var lastIncludedIndex int
+				var lastIncludedTerm int
+				buffer := bytes.NewBuffer(msg.Snapshot)
+				decoder := gob.NewDecoder(buffer)
+				decoder.Decode(&lastIncludedIndex)
+				decoder.Decode(&lastIncludedTerm)
+				database := make(map[string]string)
+				done := make(map[string]int64)
+				decoder.Decode(&database)
+				decoder.Decode(&done)
+				kv.mu.Lock()
+				kv.database = database
+				kv.done = done
+				kv.mu.Unlock()
+			} else {
+				op := msg.Command.(Op)
+				kv.mu.Lock()
+				if !kv.detectDuplicate(op.ClientID, op.Sequence) {
+					kv.apply(op)
+				}
+				ch, ok := kv.notifyCommit[msg.Index]
+				if ok {
+					ch <- op
+					DPrintf("Server %d, Send index %d to Channel %v", kv.me, msg.Index, ch)
+				}
+				if kv.maxraftstate != -1 && kv.rf.PersistStateSize() > kv.maxraftstate {
+					buffer := new(bytes.Buffer)
+					encoder := gob.NewEncoder(buffer)
+					encoder.Encode(kv.database)
+					encoder.Encode(kv.done)
+					data := buffer.Bytes()
+					go kv.rf.TakeSnapshot(data, msg.Index)
+				}
+				kv.mu.Unlock()
 			}
-			ch, ok := kv.notifyCommit[msg.Index]
-			if ok {
-				ch <- msg.Index
-				DPrintf("Server %d, Send index %d to Channel %v", kv.me, msg.Index, ch)
-			}
-			kv.mu.Unlock()
 		}
 	}()
 
