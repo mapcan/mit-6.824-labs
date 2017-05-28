@@ -22,7 +22,7 @@ import "sync"
 import "math/rand"
 import "time"
 
-import "fmt"
+//import "fmt"
 
 import "bytes"
 import "encoding/gob"
@@ -176,6 +176,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastApplied = args.LastIncludedIndex
 	rf.commitIndex = args.LastIncludedIndex
 	rf.applyCh <- msg
+	//go func() {
+	//	rf.applyCh <- msg
+	//}()
 }
 
 func (rf *Raft) TakeSnapshot(snapshot []byte, index int) {
@@ -446,7 +449,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	DPrintf("Server: %d, AfterAppend commit: %d, args: %v, log: %v\n", rf.me, rf.commitIndex, args, rf.log)
 
-	reply.Index = rf.getLastLogIndex() + 1 // no need
+	reply.Index = rf.getLastLogIndex() + 1
 	reply.Success = true
 }
 
@@ -656,9 +659,9 @@ func (rf *Raft) leaderWorker(term int) {
 		select {
 		case <-rf.replicateCh:
 			for i, repCh := range repChs {
-				go func(ch chan int) {
-					ch <- i
-				}(repCh)
+				go func(ch chan int, index int) {
+					ch <- index
+				}(repCh, i)
 			}
 		case <-time.After(time.Millisecond * 200):
 		}
@@ -792,7 +795,6 @@ func (rf *Raft) vote() {
 			rf.granted++
 			if rf.granted == len(rf.peers)/2+1 {
 				DPrintf("Server: %d, Granted: %d\n", rf.me, rf.granted)
-				fmt.Printf("Server: %d, Granted: %d\n", rf.me, rf.granted)
 				rf.role = Leader
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
@@ -800,7 +802,6 @@ func (rf *Raft) vote() {
 					rf.matchIndex[i] = 0
 					rf.nextIndex[i] = rf.getLastLogIndex() + 1
 				}
-				//rf.becomeLeaderCh <- 1
 				go rf.heartbeat()
 				go rf.leaderWorker(rf.term)
 				go func(term int) {

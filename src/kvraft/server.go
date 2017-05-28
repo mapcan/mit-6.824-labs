@@ -78,9 +78,6 @@ func (kv *RaftKV) appendLog(cmd Op) bool {
 		return false
 	}
 
-	if cmd.Operation != "Get" {
-		DPrintf("Server %d, PutAppend Key: %s, Value: %s, Index: %d", kv.me, cmd.Key, cmd.Value, index)
-	}
 	kv.mu.Lock()
 	ch, ok := kv.notifyCommit[index]
 	if !ok {
