@@ -124,29 +124,51 @@ func (sm *ShardMaster) makeNewConfig() Config {
 	return newConfig
 }
 
-func (sm *ShardMaster) rebalance(config *Config, op string, gid int) {
-	gidshard := map[int][]int{}
+func (sm *ShardMaster) rebalanceHelper(config *Config, gidshard *map[int][]int, maxGID *int, minGID *int) {
+	(*gidshard) = make(map[int][]int)
 	for shard, GID := range config.Shards {
-		gidshard[GID] = append(gidshard[GID], shard)
+		(*gidshard)[GID] = append((*gidshard)[GID], shard)
 	}
-	maxShards, maxGID := 0, 0
-	minShards, minGID := NShards+1, 0
-	for GID := range config.Groups {
-		shards := len(gidshard[GID])
+	maxShards := 0
+	*maxGID = 0
+	minShards := NShards + 1
+	*minGID = 0
+	for GID, _ := range config.Groups {
+		shards := len((*gidshard)[GID])
 		if maxShards < shards {
-			maxShards, maxGID = shards, GID
+			maxShards, *maxGID = shards, GID
 		}
 		if minShards > shards {
-			minShards, minGID = shards, GID
+			minShards, *minGID = shards, GID
 		}
 	}
+}
+
+func (sm *ShardMaster) rebalance(config *Config, op string, gid int) {
+	if len(config.Groups) == 1 {
+		for GID, _ := range config.Groups {
+			for i := 0; i < NShards; i++ {
+				config.Shards[i] = GID
+			}
+		}
+		return
+	}
+	gidshard := map[int][]int{}
+	maxGID := 0
+	minGID := 0
+
 	if op == Join {
 		n := NShards / len(config.Groups)
 		for i := 0; i < n; i++ {
+			sm.rebalanceHelper(config, &gidshard, &maxGID, &minGID)
+			if maxGID == gid {
+				break
+			}
 			shard := gidshard[maxGID][i]
 			config.Shards[shard] = gid
 		}
 	} else if op == Leave {
+		sm.rebalanceHelper(config, &gidshard, &maxGID, &minGID)
 		for _, shard := range gidshard[gid] {
 			config.Shards[shard] = minGID
 		}
