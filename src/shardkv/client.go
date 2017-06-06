@@ -11,8 +11,11 @@ package shardkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
+import "fmt"
 import "shardmaster"
 import "time"
+import "sync"
+import "io"
 
 //
 // which shard is a key in?
@@ -35,11 +38,27 @@ func nrand() int64 {
 	return x
 }
 
+func newUUID() (string, error) {
+	uuid := make([]byte, 16)
+	n, err := io.ReadFull(rand.Reader, uuid)
+	if n != len(uuid) || err != nil {
+		return "", err
+	}
+	// variant bits; see section 4.1.1
+	uuid[8] = uuid[8]&^0xc0 | 0x80
+	// version 4 (pseudo-random); see section 4.1.3
+	uuid[6] = uuid[6]&^0xf0 | 0x40
+	return fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:]), nil
+}
+
 type Clerk struct {
 	sm       *shardmaster.Clerk
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	id       string
+	sequence int64
+	mu       sync.Mutex
 }
 
 //
@@ -56,6 +75,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.id, _ = newUUID()
+	ck.sequence = 0
 	return ck
 }
 
@@ -67,7 +88,12 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 //
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
+	ck.mu.Lock()
 	args.Key = key
+	args.ClientID = ck.id
+	args.Sequence = ck.sequence
+	ck.sequence++
+	ck.mu.Unlock()
 
 	for {
 		shard := key2shard(key)
@@ -88,7 +114,10 @@ func (ck *Clerk) Get(key string) string {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask master for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		config := ck.sm.Query(-1)
+		ck.mu.Lock()
+		ck.config = config
+		ck.mu.Unlock()
 	}
 
 	return ""
@@ -100,10 +129,14 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := PutAppendArgs{}
+	ck.mu.Lock()
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
+	args.ClientID = ck.id
+	args.Sequence = ck.sequence
+	ck.sequence++
+	ck.mu.Unlock()
 
 	for {
 		shard := key2shard(key)
@@ -123,7 +156,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask master for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		config := ck.sm.Query(-1)
+		ck.mu.Lock()
+		ck.config = config
+		ck.mu.Unlock()
 	}
 }
 
