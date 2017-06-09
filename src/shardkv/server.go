@@ -231,18 +231,17 @@ func (kv *ShardKV) PullState(args *PullStateArgs, reply *PullStateReply) {
 	//fmt.Printf("Server %d GID %d Num %d, End PullState %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum)
 }
 
-func (kv *ShardKV) push(gid int, shard int, config *shardmaster.Config) bool {
-	if kv.pushed[shard] >= config.Num {
-		return true
-	}
+func (kv *ShardKV) makePushStateArgs(shard int, config *shardmaster.Config) *PushStateArgs {
+	args := PushStateArgs{}
+	args.ConfigNum = config.Num
+	args.Shard = shard
+	kv.makeStateToPush(shard, &args)
+	return &args
+}
 
-	args := PushStateArgs{
-		ConfigNum: config.Num,
-		Shard:     shard,
-	}
+func (kv *ShardKV) makeStateToPush(shard int, args *PushStateArgs) {
 	args.Database = make(map[string]string)
 	args.Done = make(map[string]int64)
-
 	for key, value := range kv.database {
 		if key2shard(key) == shard {
 			args.Database[key] = value
@@ -251,19 +250,42 @@ func (kv *ShardKV) push(gid int, shard int, config *shardmaster.Config) bool {
 	for clientID, sequence := range kv.done {
 		args.Done[clientID] = sequence
 	}
+}
 
+func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardmaster.Config, wg *sync.WaitGroup) bool {
+	//if kv.pushed[shard] >= config.Num {
+	//	return true
+	//}
+
+	//args := PushStateArgs{
+	//	ConfigNum: config.Num,
+	//	Shard:     shard,
+	//}
+	//args.Database = make(map[string]string)
+	//args.Done = make(map[string]int64)
+
+	//for key, value := range kv.database {
+	//	if key2shard(key) == shard {
+	//		args.Database[key] = value
+	//	}
+	//}
+	//for clientID, sequence := range kv.done {
+	//	args.Done[clientID] = sequence
+	//}
+
+	defer wg.Done()
 	for {
 		for _, server := range config.Groups[gid] {
 			ck := kv.make_end(server)
 			reply := PushStateReply{}
 			fmt.Printf("Server %d GID %d Num %d, Start migrate to Server %v, Shard: %d, Database: %v\n", kv.me, kv.gid, config.Num, server, shard, args.Database)
-			ok := ck.Call("ShardKV.PushState", &args, &reply)
+			ok := ck.Call("ShardKV.PushState", args, &reply)
 			fmt.Printf("Server %d GID %d Num %d, Finish migrate to Server %v, Shard: %d, Reply: %v\n", kv.me, kv.gid, config.Num, server, shard, reply)
 			if ok && reply.WrongLeader {
 				continue
 			}
 			if ok && reply.Err == OK {
-				kv.pushed[shard] = config.Num
+				//kv.pushed[shard] = config.Num
 				return true
 			}
 		}
@@ -315,22 +337,33 @@ func (kv *ShardKV) apply(cmd Op) {
 		fmt.Printf("Server %d GID %d Num %d applied Append, Key: %s, Value: %s\n", kv.me, kv.gid, kv.config.Num, cmd.Key, kv.database[cmd.Key])
 	case "Reconfig":
 		fmt.Printf("Server %d, GID: %d, Old Config: %v, New Config: %v\n", kv.me, kv.gid, kv.config.Shards, cmd.Config.Shards)
+		var wg sync.WaitGroup
 		for shard, gid := range kv.config.Shards {
 			if gid == 0 || gid == cmd.Config.Shards[shard] {
 				continue
 			}
-			if kv.gid != gid && kv.gid == cmd.Config.Shards[shard] {
-				if !kv.pull(gid, shard) {
-					return
-				}
-			}
-			//if kv.gid == gid && kv.gid != cmd.Config.Shards[shard] {
-			//	if !kv.push(cmd.Config.Shards[shard], shard, &cmd.Config) {
+			//if kv.gid != gid && kv.gid == cmd.Config.Shards[shard] {
+			//	if !kv.pull(gid, shard) {
 			//		return
 			//	}
 			//}
+			if kv.gid == gid && kv.gid != cmd.Config.Shards[shard] {
+				wg.Add(1)
+				args := kv.makePushStateArgs(shard, &cmd.Config)
+				go kv.push(args, cmd.Config.Shards[shard], shard, &cmd.Config, &wg)
+				//if !kv.push(args, cmd.Config.Shards[shard], shard, &cmd.Config, &wg) {
+				//	return
+				//}
+			}
 		}
-		kv.config = cmd.Config
+		go func(config shardmaster.Config) {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+			fmt.Printf("Server %d GID %d Num %d, Old Config: %v, New Config: %v\n", kv.me, kv.gid, kv.config.Num, kv.config, config)
+			if config.Num > kv.config.Num {
+				kv.config = config
+			}
+		}(cmd.Config)
 	}
 	kv.done[cmd.ClientID] = cmd.Sequence
 }
@@ -405,11 +438,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 				decoder.Decode(&lastIncludedTerm)
 				database := make(map[string]string)
 				done := make(map[string]int64)
+				var config shardmaster.Config
 				decoder.Decode(&database)
 				decoder.Decode(&done)
+				decoder.Decode(&config)
 				kv.mu.Lock()
 				kv.database = database
 				kv.done = done
+				kv.config = config
 				kv.mu.Unlock()
 			} else {
 				op := msg.Command.(Op)
@@ -426,7 +462,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 					encoder := gob.NewEncoder(buffer)
 					encoder.Encode(kv.database)
 					encoder.Encode(kv.done)
+					encoder.Encode(kv.config)
 					data := buffer.Bytes()
+					fmt.Printf("Server %d GID %d Num %d, Take Snapshot\n", kv.me, kv.gid, kv.config.Num)
 					go kv.rf.TakeSnapshot(data, msg.Index)
 				}
 				kv.mu.Unlock()
