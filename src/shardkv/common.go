@@ -10,9 +10,10 @@ package shardkv
 //
 
 const (
-	OK            = "OK"
-	ErrNoKey      = "ErrNoKey"
-	ErrWrongGroup = "ErrWrongGroup"
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongConfigNum = "ErrWrongConfigNum"
 )
 
 type Err string
@@ -46,4 +47,32 @@ type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+type PullStateArgs struct {
+	ConfigNum int
+	Shard     int
+	ClientID  string
+	Sequence  int64
+}
+
+type PullStateReply struct {
+	WrongLeader bool
+	Err         Err
+	Database    map[string]string
+	Done        map[string]int64
+}
+
+type PushStateArgs struct {
+	ConfigNum int
+	Shard     int
+	Database  map[string]string
+	Done      map[string]int64
+	ClientID  string
+	Sequence  int64
+}
+
+type PushStateReply struct {
+	WrongLeader bool
+	Err         Err
 }

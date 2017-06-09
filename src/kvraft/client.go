@@ -99,16 +99,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		for i, server := range ck.servers {
 			var reply PutAppendReply
-			if value == "14" {
-				DPrintf("Server %d, Put14, PutAppendArgs: %v", i, request)
-			}
 			ok := server.Call("RaftKV.PutAppend", &request, &reply)
-			if value == "14" {
-				DPrintf("Server %d, Put14, PutAppendReply: %v", i, reply)
-			}
 			if ok && !reply.WrongLeader {
-				DPrintf("Server %d, Key: %s, Value: %s, PutAppendArgs: %v", i, request.Key, request.Value, request)
-				DPrintf("Server %d, Key: %s, Value: %s, PutAppendReply: %v", i, request.Key, request.Value, reply)
 				return
 			}
 		}

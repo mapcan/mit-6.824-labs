@@ -79,14 +79,6 @@ func (sm *ShardMaster) equalOp(op1 Op, op2 Op) bool {
 	return true
 }
 
-//func (sm *ShardMaster) getSequence() int64 {
-//	sm.mu.Lock()
-//	defer sm.mu.Unlock()
-//	seq := sm.sequence
-//	sm.sequence += 1
-//	return seq
-//}
-
 func (sm *ShardMaster) appendLog(cmd Op) bool {
 	index, _, isLeader := sm.rf.Start(cmd)
 	if !isLeader {
