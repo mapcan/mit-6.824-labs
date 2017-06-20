@@ -21,16 +21,9 @@ type Op struct {
 	Key       string
 	Value     string
 	Config    shardmaster.Config
-}
-
-func (op *Op) Equals(o *Op) bool {
-	if op.Operation == o.Operation {
-		if op.Operation == "Reconfig" {
-			return op.Sequence == o.Sequence
-		}
-		return op.ClientID == o.ClientID && op.Sequence == op.Sequence
-	}
-	return false
+	Database  map[string]string
+	Done      map[string]int64
+	c         chan error
 }
 
 type ShardKV struct {
@@ -44,13 +37,16 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	database     map[string]string
-	done         map[string]int64
-	notifyCommit map[int]chan Op
-	alive        int32
-	config       shardmaster.Config
-	pulled       [shardmaster.NShards]int
-	pushed       [shardmaster.NShards]int
+	id       string
+	database map[string]string
+	done     map[string]int64
+	//notifyCommit   map[int]chan Op
+	alive          int32
+	sequence       int64
+	config         shardmaster.Config
+	pulled         [shardmaster.NShards]int
+	pushed         [shardmaster.NShards]int
+	shardConfigNum [shardmaster.NShards]int
 }
 
 func (kv *ShardKV) detectDuplicate(clientID string, sequence int64) bool {
@@ -59,29 +55,20 @@ func (kv *ShardKV) detectDuplicate(clientID string, sequence int64) bool {
 }
 
 func (kv *ShardKV) appendLog(cmd Op) bool {
-	index, _, isLeader := kv.rf.Start(cmd)
+	//if cmd.Operation != "Reconfig" {
+	//	fmt.Printf("Server %d GID %d Num %d, Raft Start cmd: %v\n", kv.me, kv.gid, kv.config.Num, cmd)
+	//}
+	_, _, isLeader := kv.rf.Start(cmd)
+	//if cmd.Operation != "Reconfig" {
+	//	fmt.Printf("Server %d GID %d Num %d, Raft End cmd: %v\n", kv.me, kv.gid, kv.config.Num, cmd)
+	//}
 	if !isLeader {
 		return false
 	}
 
-	//fmt.Printf("Server %d GID %d Num %d, Try Acquire AppendLog Mutex\n", kv.me, kv.gid, kv.config.Num)
-	kv.mu.Lock()
-	ch, ok := kv.notifyCommit[index]
-	if !ok {
-		ch = make(chan Op, 1)
-		kv.notifyCommit[index] = ch
-	}
-	kv.mu.Unlock()
-	//fmt.Printf("Server %d GID %d Num %d, Release AppendLog Mutex\n", kv.me, kv.gid, kv.config.Num)
-
 	select {
-	case op := <-ch:
-		kv.mu.Lock()
-		delete(kv.notifyCommit, index)
-		kv.mu.Unlock()
-		return cmd.Equals(&op)
-	case <-time.After(10000 * time.Millisecond):
-		return false
+	case <-cmd.c:
+		return true
 	}
 }
 
@@ -92,6 +79,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		Sequence:  args.Sequence,
 		Operation: "Get",
 		Key:       args.Key,
+		c:         make(chan error, 1),
 	}
 
 	kv.mu.Lock()
@@ -124,6 +112,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Operation: args.Op,
 		Key:       args.Key,
 		Value:     args.Value,
+		c:         make(chan error, 1),
 	}
 
 	kv.mu.Lock()
@@ -161,17 +150,26 @@ func (kv *ShardKV) Alive() bool {
 
 func (kv *ShardKV) PushState(args *PushStateArgs, reply *PushStateReply) {
 	op := Op{
-		ClientID:  "Local.PushState",
-		Sequence:  int64(args.ConfigNum),
-		Operation: "Push",
+		ClientID:  args.ClientID,
+		Sequence:  args.Sequence,
+		Operation: "PushState",
+		c:         make(chan error, 1),
+	}
+	op.Database = make(map[string]string)
+	for key, value := range args.Database {
+		op.Database[key] = value
+	}
+	op.Done = make(map[string]int64)
+	for clientID, sequence := range args.Done {
+		op.Done[clientID] = sequence
 	}
 	if !kv.appendLog(op) {
 		reply.WrongLeader = true
 		return
 	}
 
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	//kv.mu.Lock()
+	//defer kv.mu.Unlock()
 
 	//if args.ConfigNum < kv.config.Num {
 	//	fmt.Printf("Server %d GID %d Num %d, WrongConfigNum, args.ConfigNum: %d, kv.config.Num: %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum, kv.config.Num)
@@ -180,14 +178,14 @@ func (kv *ShardKV) PushState(args *PushStateArgs, reply *PushStateReply) {
 	//	return
 	//}
 
-	for key, value := range args.Database {
-		kv.database[key] = value
-	}
-	for clientID, sequence := range args.Done {
-		if kv.done[clientID] < sequence {
-			kv.done[clientID] = sequence
-		}
-	}
+	//for key, value := range args.Database {
+	//	kv.database[key] = value
+	//}
+	//for clientID, sequence := range args.Done {
+	//	if kv.done[clientID] < sequence {
+	//		kv.done[clientID] = sequence
+	//	}
+	//}
 	reply.Err = OK
 }
 
@@ -196,6 +194,7 @@ func (kv *ShardKV) PullState(args *PullStateArgs, reply *PullStateReply) {
 		ClientID:  "Local.PullState",
 		Sequence:  int64(args.ConfigNum),
 		Operation: "Pull",
+		c:         make(chan error, 1),
 	}
 	//fmt.Printf("Server %d GID %d Num %d, Begin AppendLog %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum)
 	if !kv.appendLog(op) {
@@ -233,6 +232,9 @@ func (kv *ShardKV) PullState(args *PullStateArgs, reply *PullStateReply) {
 
 func (kv *ShardKV) makePushStateArgs(shard int, config *shardmaster.Config) *PushStateArgs {
 	args := PushStateArgs{}
+	args.ClientID = kv.id
+	args.Sequence = kv.sequence
+	kv.sequence++
 	args.ConfigNum = config.Num
 	args.Shard = shard
 	kv.makeStateToPush(shard, &args)
@@ -252,28 +254,7 @@ func (kv *ShardKV) makeStateToPush(shard int, args *PushStateArgs) {
 	}
 }
 
-func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardmaster.Config, wg *sync.WaitGroup) bool {
-	//if kv.pushed[shard] >= config.Num {
-	//	return true
-	//}
-
-	//args := PushStateArgs{
-	//	ConfigNum: config.Num,
-	//	Shard:     shard,
-	//}
-	//args.Database = make(map[string]string)
-	//args.Done = make(map[string]int64)
-
-	//for key, value := range kv.database {
-	//	if key2shard(key) == shard {
-	//		args.Database[key] = value
-	//	}
-	//}
-	//for clientID, sequence := range kv.done {
-	//	args.Done[clientID] = sequence
-	//}
-
-	defer wg.Done()
+func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardmaster.Config) bool {
 	for {
 		for _, server := range config.Groups[gid] {
 			ck := kv.make_end(server)
@@ -285,7 +266,6 @@ func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardma
 				continue
 			}
 			if ok && reply.Err == OK {
-				//kv.pushed[shard] = config.Num
 				return true
 			}
 		}
@@ -335,35 +315,28 @@ func (kv *ShardKV) apply(cmd Op) {
 	case "Append":
 		kv.database[cmd.Key] += cmd.Value
 		fmt.Printf("Server %d GID %d Num %d applied Append, Key: %s, Value: %s\n", kv.me, kv.gid, kv.config.Num, cmd.Key, kv.database[cmd.Key])
+	case "PushState":
+		fmt.Printf("Server %d GID %d Num %d applied PushState, State: %v\n", kv.me, kv.gid, kv.config.Num, cmd.Database)
+		for key, value := range cmd.Database {
+			kv.database[key] = value
+		}
+		for clientID, sequence := range cmd.Done {
+			if kv.done[clientID] < sequence {
+				kv.done[clientID] = sequence
+			}
+		}
 	case "Reconfig":
-		fmt.Printf("Server %d, GID: %d, Old Config: %v, New Config: %v\n", kv.me, kv.gid, kv.config.Shards, cmd.Config.Shards)
-		var wg sync.WaitGroup
+		fmt.Printf("Server %d, GID: %d, Old Config: %d %v, New Config: %d %v\n", kv.me, kv.gid, kv.config.Num, kv.config.Shards, cmd.Config.Num, cmd.Config.Shards)
 		for shard, gid := range kv.config.Shards {
 			if gid == 0 || gid == cmd.Config.Shards[shard] {
 				continue
 			}
-			//if kv.gid != gid && kv.gid == cmd.Config.Shards[shard] {
-			//	if !kv.pull(gid, shard) {
-			//		return
-			//	}
-			//}
 			if kv.gid == gid && kv.gid != cmd.Config.Shards[shard] {
-				wg.Add(1)
 				args := kv.makePushStateArgs(shard, &cmd.Config)
-				go kv.push(args, cmd.Config.Shards[shard], shard, &cmd.Config, &wg)
-				//if !kv.push(args, cmd.Config.Shards[shard], shard, &cmd.Config, &wg) {
-				//	return
-				//}
+				kv.push(args, cmd.Config.Shards[shard], shard, &cmd.Config)
 			}
 		}
-		go func(config shardmaster.Config) {
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
-			fmt.Printf("Server %d GID %d Num %d, Old Config: %v, New Config: %v\n", kv.me, kv.gid, kv.config.Num, kv.config, config)
-			if config.Num > kv.config.Num {
-				kv.config = config
-			}
-		}(cmd.Config)
+		kv.config = cmd.Config
 	}
 	kv.done[cmd.ClientID] = cmd.Sequence
 }
@@ -411,7 +384,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Your initialization code here.
 	kv.done = make(map[string]int64)
 	kv.database = make(map[string]string)
-	kv.notifyCommit = make(map[int]chan Op)
+	//kv.notifyCommit = make(map[int]chan Op)
+	kv.id, _ = newUUID()
+	kv.sequence = 0
 	atomic.StoreInt32(&kv.alive, 1)
 
 	// Use something like this to talk to the shardmaster:
@@ -422,6 +397,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	for i := 0; i < shardmaster.NShards; i++ {
 		kv.pulled[i] = 0
 		kv.pushed[i] = 0
+		kv.shardConfigNum[i] = 0
 	}
 
 	fmt.Printf("Server %d GID %d started\n", kv.me, kv.gid)
@@ -438,31 +414,36 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 				decoder.Decode(&lastIncludedTerm)
 				database := make(map[string]string)
 				done := make(map[string]int64)
-				var config shardmaster.Config
+				//var config shardmaster.Config
 				decoder.Decode(&database)
 				decoder.Decode(&done)
-				decoder.Decode(&config)
+				//decoder.Decode(&config)
 				kv.mu.Lock()
 				kv.database = database
 				kv.done = done
-				kv.config = config
+				//kv.config = config
 				kv.mu.Unlock()
 			} else {
 				op := msg.Command.(Op)
 				kv.mu.Lock()
 				if !kv.detectDuplicate(op.ClientID, op.Sequence) {
 					kv.apply(op)
+				} else {
+					fmt.Printf("Server %d GID %d Num %d, apply PushState duplicate detected, ClientID: %s, Sequence: %d, Database: %v\n", kv.me, kv.gid, kv.config.Num, op.ClientID, op.Sequence, op.Database)
 				}
-				ch, ok := kv.notifyCommit[msg.Index]
-				if ok {
-					ch <- op
+				//ch, ok := kv.notifyCommit[msg.Index]
+				//if ok {
+				//	ch <- op
+				//}
+				if op.c != nil {
+					op.c <- nil
 				}
 				if kv.maxraftstate != -1 && kv.rf.PersistStateSize() > kv.maxraftstate {
 					buffer := new(bytes.Buffer)
 					encoder := gob.NewEncoder(buffer)
 					encoder.Encode(kv.database)
 					encoder.Encode(kv.done)
-					encoder.Encode(kv.config)
+					//encoder.Encode(kv.config)
 					data := buffer.Bytes()
 					fmt.Printf("Server %d GID %d Num %d, Take Snapshot\n", kv.me, kv.gid, kv.config.Num)
 					go kv.rf.TakeSnapshot(data, msg.Index)
@@ -482,10 +463,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 			for n := curNum + 1; n <= config.Num; n++ {
 				c := ck.Query(n)
 				cmd := Op{
-					ClientID:  "Local.Reconf",
+					ClientID:  "Server.Reconfig",
 					Sequence:  int64(n),
 					Operation: "Reconfig",
 					Config:    c,
+					c:         make(chan error, 1),
 				}
 				kv.appendLog(cmd)
 			}
