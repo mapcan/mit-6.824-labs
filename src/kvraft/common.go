@@ -24,6 +24,13 @@ type PutAppendReply struct {
 	Err         Err
 }
 
+func NewPutAppendReply(wrongLeader bool, err Err) *PutAppendReply {
+	return &PutAppendReply{
+		WrongLeader: wrongLeader,
+		Err:         err,
+	}
+}
+
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
@@ -35,4 +42,12 @@ type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+func NewGetReply(wrongLeader bool, err Err, value string) *GetReply {
+	return &GetReply{
+		WrongLeader: wrongLeader,
+		Err:         err,
+		Value:       value,
+	}
 }

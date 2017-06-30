@@ -6,6 +6,7 @@ import "math/big"
 import "sync"
 import "fmt"
 import "io"
+import "log"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -97,9 +98,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	request.Op = op
 	ck.mu.Unlock()
 	for {
-		for _, server := range ck.servers {
+		for i, server := range ck.servers {
 			var reply PutAppendReply
+			log.Printf("Client Call Server %d PutAppend Args: %+v\n", i, request)
 			ok := server.Call("RaftKV.PutAppend", &request, &reply)
+			log.Printf("Client Call Server %d PutAppend Reply: %+v\n", i, reply)
 			if ok && !reply.WrongLeader {
 				return
 			}

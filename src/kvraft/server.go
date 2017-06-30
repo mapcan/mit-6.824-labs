@@ -8,7 +8,7 @@ import (
 	"log"
 	"raft"
 	"sync"
-	"time"
+	//"time"
 )
 
 const Debug = 0
@@ -20,98 +20,59 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	ClientID  string
-	Sequence  int64
-	Operation string
-	Key       string
-	Value     string
+const (
+	Stopped = "stopped"
+	Running = "running"
+)
+
+type Event struct {
+	Target      interface{}
+	returnValue interface{}
+	c           chan error
 }
 
 type RaftKV struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-
+	mu           sync.RWMutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	database     map[string]string
-	done         map[string]int64
-	notifyCommit map[int]chan Op
+	kv           *KV
+	recorder     *Recorder
+	stopped      chan bool
+	c            chan *Event
+	state        string
+	routineGroup sync.WaitGroup
 }
 
-func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	cmd := Op{
-		ClientID:  args.ClientID,
-		Sequence:  args.Sequence,
-		Operation: "Get",
-		Key:       args.Key,
-	}
-	ok := kv.appendLog(cmd)
-	if !ok {
-		reply.WrongLeader = true
-	} else {
-		reply.WrongLeader = false
-		reply.Err = OK
-		kv.mu.Lock()
-		reply.Value = kv.database[cmd.Key]
-		DPrintf("Server %d, Get Key: %s, Get Value: %s, database: %v", kv.me, cmd.Key, reply.Value, kv.database)
-		kv.done[cmd.ClientID] = cmd.Sequence
-		kv.mu.Unlock()
-	}
+func (rs *RaftKV) setState(state string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.state = state
 }
 
-func (kv *RaftKV) detectDuplicate(clientID string, sequence int64) bool {
-	seq, ok := kv.done[clientID]
-	return ok && seq >= sequence
+func (rs *RaftKV) Running() bool {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.state != Stopped
 }
 
-func (kv *RaftKV) appendLog(cmd Op) bool {
-	index, _, isLeader := kv.rf.Start(cmd)
-	if !isLeader {
-		return false
-	}
-
-	kv.mu.Lock()
-	ch, ok := kv.notifyCommit[index]
-	if !ok {
-		ch = make(chan Op, 1)
-		kv.notifyCommit[index] = ch
-	}
-	kv.mu.Unlock()
-
-	select {
-	case op := <-ch:
-		kv.mu.Lock()
-		delete(kv.notifyCommit, index)
-		kv.mu.Unlock()
-		return cmd == op
-	case <-time.After(1000 * time.Millisecond):
-		return false
-	}
+func (rs *RaftKV) Get(args *GetArgs, reply *GetReply) {
+	rs.send(args, reply)
 }
 
-func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	cmd := Op{
-		ClientID:  args.ClientID,
-		Sequence:  args.Sequence,
-		Operation: args.Op,
-		Key:       args.Key,
-		Value:     args.Value,
-	}
-	ok := kv.appendLog(cmd)
-	if ok {
-		reply.Err = OK
-	} else {
-		reply.WrongLeader = true
-		reply.Err = "WrongLeader"
-	}
+func (rs *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	log.Printf("Server %d, Received PutAppendArgs: %+v\n", rs.me, args)
+	rs.send(args, reply)
+	log.Printf("Server %d, Processed PutAppend, Reply: %+v\n", rs.me, reply)
+}
+
+func (rs *RaftKV) State() string {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.state
 }
 
 //
@@ -120,9 +81,15 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 //
-func (kv *RaftKV) Kill() {
-	kv.rf.Kill()
+func (rs *RaftKV) Kill() {
 	// Your code here, if desired.
+	if rs.State() == Stopped {
+		return
+	}
+	close(rs.stopped)
+	rs.routineGroup.Wait()
+	rs.setState(Stopped)
+	rs.rf.Kill()
 }
 
 //
@@ -138,78 +105,175 @@ func (kv *RaftKV) Kill() {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func (kv *RaftKV) apply(cmd Op) {
-	switch cmd.Operation {
-	case "Put":
-		kv.database[cmd.Key] = cmd.Value
-	case "Append":
-		//fmt.Printf("Append Key: %s, Value: %s\n", cmd.Key, cmd.Value)
-		kv.database[cmd.Key] += cmd.Value
+
+func (rs *RaftKV) send(value1 interface{}, value2 interface{}) error {
+	if !rs.Running() {
+		return raft.StopError
 	}
-	kv.done[cmd.ClientID] = cmd.Sequence
+	event := &Event{
+		Target:      value1,
+		returnValue: value2,
+		c:           make(chan error, 1),
+	}
+	select {
+	case rs.c <- event:
+	case <-rs.stopped:
+		return raft.StopError
+	}
+	log.Printf("Server %d Wait For Event.c %v\n", rs.me, event.c)
+	select {
+	case err := <-event.c:
+		return err
+	case <-rs.stopped:
+		return raft.StopError
+	}
+}
+
+func (rs *RaftKV) save() ([]byte, error) {
+	buffer := new(bytes.Buffer)
+	encoder := gob.NewEncoder(buffer)
+	encoder.Encode(rs.kv)
+	encoder.Encode(rs.recorder)
+	data := buffer.Bytes()
+	return data, nil
+}
+
+func (rs *RaftKV) recovery(snapshot []byte) error {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	buffer := bytes.NewBuffer(snapshot)
+	decoder := gob.NewDecoder(buffer)
+	decoder.Decode(&lastIncludedIndex)
+	decoder.Decode(&lastIncludedTerm)
+	kv := NewKV()
+	recorder := NewRecorder()
+	decoder.Decode(&kv)
+	decoder.Decode(&recorder)
+	rs.kv = kv
+	rs.recorder = recorder
+	return nil
+}
+
+func (rs *RaftKV) processGetArgs(a interface{}, r interface{}) {
+	var reply *GetReply
+	args := a.(*GetArgs)
+	if r != nil {
+		reply = r.(*GetReply)
+	} else {
+		reply = nil
+	}
+	cid, key, seq := args.ClientID, args.Key, args.Sequence
+	if reply != nil {
+		reply.Value = rs.kv.Get(key)
+		reply.Err = OK
+	}
+	rs.recorder.Record(cid, seq)
+}
+
+func (rs *RaftKV) processPutAppendArgs(a interface{}, r interface{}) {
+	var reply *PutAppendReply
+	args := a.(*PutAppendArgs)
+	if r != nil {
+		reply = r.(*PutAppendReply)
+	} else {
+		reply = nil
+	}
+	key, value, op, cid, seq := args.Key, args.Value, args.Op, args.ClientID, args.Sequence
+	if rs.recorder.Recorded(cid, seq) {
+		if reply != nil {
+			reply.Err = OK
+		}
+	} else {
+		switch op {
+		case "Put":
+			rs.kv.Set(key, value)
+		case "Append":
+			v := rs.kv.Get(key)
+			rs.kv.Set(key, v+value)
+		}
+		if reply != nil {
+			reply.Err = OK
+		}
+		rs.recorder.Record(cid, seq)
+	}
+}
+
+func (rs *RaftKV) processApplyMsg(msg *raft.ApplyMsg) {
+	log.Printf("Server %d Received ApplyMsg: %+v\n", rs.me, msg)
+	if msg.UseSnapshot {
+		rs.recovery(msg.Snapshot)
+	} else {
+		event := msg.Command.(*Event)
+		switch args := event.Target.(type) {
+		case *GetArgs:
+			rs.processGetArgs(args, event.returnValue)
+		case *PutAppendArgs:
+			rs.processPutAppendArgs(args, event.returnValue)
+		}
+		if event.c != nil {
+			log.Printf("Server %d Event Processed, Send Event.c %v\n", rs.me, event.c)
+			event.c <- nil
+		}
+	}
+}
+
+func (rs *RaftKV) processCommand(event *Event) {
+	//log.Printf("Server %d Send Raft Event: %+v\n", rs.me, event)
+	_, _, isLeader := rs.rf.Start(event)
+	if isLeader {
+		log.Printf("Server %d NotLeader, Event: %+v\n", rs.me, event)
+		return
+	}
+	switch event.Target.(type) {
+	case *GetArgs:
+		reply := event.returnValue.(*GetReply)
+		reply.WrongLeader = true
+	case *PutAppendArgs:
+		reply := event.returnValue.(*PutAppendReply)
+		reply.WrongLeader = true
+	}
+	event.c <- raft.NotLeaderError
+}
+
+func (rs *RaftKV) loop() {
+	for {
+		select {
+		case <-rs.stopped:
+			rs.setState(Stopped)
+			return
+		case msg := <-rs.applyCh:
+			rs.processApplyMsg(&msg)
+		case event := <-rs.c:
+			//log.Printf("Server %d start processing Event: %+v\n", rs.me, event)
+			rs.processCommand(event)
+		}
+	}
 }
 
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *RaftKV {
 	// call gob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	gob.Register(Op{})
+	gob.Register(&Event{})
+	gob.Register(&PutAppendArgs{})
+	gob.Register(&GetArgs{})
 
-	kv := new(RaftKV)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
+	rs := &RaftKV{
+		me:           me,
+		maxraftstate: maxraftstate,
+		kv:           NewKV(),
+		recorder:     NewRecorder(),
+		applyCh:      make(chan raft.ApplyMsg),
+		stopped:      make(chan bool),
+		state:        Running,
+		c:            make(chan *Event, 256),
+	}
 
-	// You may need initialization code here.
-	kv.done = make(map[string]int64)
-	kv.database = make(map[string]string)
-	kv.notifyCommit = make(map[int]chan Op)
-
-	kv.applyCh = make(chan raft.ApplyMsg)
-
-	// You may need initialization code here.
+	rs.routineGroup.Add(1)
 	go func() {
-		for {
-			msg := <-kv.applyCh
-			DPrintf("Server %d, ApplyMsg: %v", kv.me, msg)
-			if msg.UseSnapshot {
-				var lastIncludedIndex int
-				var lastIncludedTerm int
-				buffer := bytes.NewBuffer(msg.Snapshot)
-				decoder := gob.NewDecoder(buffer)
-				decoder.Decode(&lastIncludedIndex)
-				decoder.Decode(&lastIncludedTerm)
-				database := make(map[string]string)
-				done := make(map[string]int64)
-				decoder.Decode(&database)
-				decoder.Decode(&done)
-				kv.mu.Lock()
-				kv.database = database
-				kv.done = done
-				kv.mu.Unlock()
-			} else {
-				op := msg.Command.(Op)
-				kv.mu.Lock()
-				if !kv.detectDuplicate(op.ClientID, op.Sequence) {
-					kv.apply(op)
-				}
-				ch, ok := kv.notifyCommit[msg.Index]
-				if ok {
-					ch <- op
-					DPrintf("Server %d, Send index %d to Channel %v", kv.me, msg.Index, ch)
-				}
-				if kv.maxraftstate != -1 && persister.RaftStateSize() > kv.maxraftstate && kv.rf != nil {
-					buffer := new(bytes.Buffer)
-					encoder := gob.NewEncoder(buffer)
-					encoder.Encode(kv.database)
-					encoder.Encode(kv.done)
-					data := buffer.Bytes()
-					go kv.rf.TakeSnapshot(data, msg.Index, msg.Term)
-				}
-				kv.mu.Unlock()
-			}
-		}
+		defer rs.routineGroup.Done()
+		rs.loop()
 	}()
 
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	return kv
+	rs.rf = raft.Make(servers, me, persister, rs.applyCh)
+	return rs
 }
