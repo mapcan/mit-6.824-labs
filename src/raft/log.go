@@ -1,6 +1,5 @@
 package raft
 
-import logger "log"
 import "fmt"
 import "sync"
 import "bytes"
@@ -105,7 +104,6 @@ func (log *Log) CreateEntry(term int, command interface{}, event *Event) *LogEnt
 	return NewLogEntry(log, event, log.NextIndex(), term, command)
 }
 
-// if entry has been eliminated because of snapshot then nil is returned
 func (log *Log) GetEntry(index int) *LogEntry {
 	log.RLock()
 	defer log.RUnlock()
@@ -128,7 +126,6 @@ func (log *Log) GetEntriesAfter(index int) ([]*LogEntry, int) {
 		return nil, 0
 	}
 	if index > log.startIndex+len(log.entries) {
-		//panic(fmt.Sprintf("Raft: Index is beyond end of log: %v %v", log.startIndex+len(log.entries), index))
 		index = log.startIndex + len(log.entries)
 	}
 	if index == log.startIndex {
@@ -182,11 +179,9 @@ func (log *Log) SetCommitIndex(index int) error {
 	if index < log.commitIndex {
 		return nil
 	}
-	fmt.Printf("Server SetCommitIndex, Index: %d, log.startIndex: %d, log.commitIndex: %d, entries.len: %d\n", index, log.startIndex, log.commitIndex, len(log.entries))
 	for i := log.commitIndex + 1; i <= index; i++ {
 		entry := log.entries[i-log.startIndex-1]
 		log.commitIndex = entry.Index
-		logger.Printf("Log %p Apply entry, Index: %d\n", log, entry.Index)
 		returnValue, err := log.apply(entry)
 		if entry.event != nil {
 			entry.event.returnValue = returnValue
@@ -266,9 +261,7 @@ func (log *Log) AppendEntry(entry *LogEntry) error {
 		}
 	}
 
-	logger.Printf("Log Entries Before Append: %+v\n", log.entries)
 	log.entries = append(log.entries, entry)
-	logger.Printf("Log Entries After Append: %+v\n", log.entries)
 
 	return nil
 }
@@ -284,7 +277,6 @@ func (log *Log) Compact(index int, term int) (int, int, error) {
 	} else if index < log.startIndex {
 		return 0, 0, fmt.Errorf("Raft.Log: Compact, Index does not exist, (%v,%v)", index, log.startIndex)
 	} else {
-		logger.Printf("Log: %p, LogCompact, Index: %d, Log.startIndex: %d, len(Log.Entries): %d\n", log, index, log.startIndex, len(log.entries))
 		entries = log.entries[index-log.startIndex:]
 	}
 	log.startIndex = index
@@ -295,27 +287,6 @@ func (log *Log) Compact(index int, term int) (int, int, error) {
 	}
 	return log.startTerm, log.startIndex, nil
 }
-
-//func (log *Log) Compact(index int, term int) error {
-//	log.Lock()
-//	defer log.Unlock()
-//
-//	if index == 0 {
-//		return nil
-//	}
-//
-//	var entries []*LogEntry
-//	if index >= log.InternalCurrentIndex() {
-//		entries = make([]*LogEntry, 0)
-//	} else {
-//		entries = log.entries[index-log.startIndex:]
-//	}
-//
-//	log.entries = entries
-//	log.startIndex = index
-//	log.startTerm = term
-//	return nil
-//}
 
 func (log *Log) Open() {
 }

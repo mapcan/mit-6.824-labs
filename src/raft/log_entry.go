@@ -8,18 +8,6 @@ type LogEntry struct {
 	event   *Event
 }
 
-//func (entry *LogEntry) GetTerm() int {
-//	return entry.Term
-//}
-//
-//func (entry *LogEntry) GetIndex() int {
-//	return entry.Index
-//}
-//
-//func (entry *LogEntry) GetCommand() interface{} {
-//	return entry.Command
-//}
-
 func NewLogEntry(log *Log, event *Event, index int, term int, command interface{}) *LogEntry {
 	entry := LogEntry{}
 	entry.Term = term

@@ -1,7 +1,5 @@
 package raft
 
-import "fmt"
-import "log"
 import "sync"
 import "time"
 import "labrpc"
@@ -92,7 +90,6 @@ func (p *Peer) heartbeat(c chan bool) {
 
 	c <- true
 
-	//log.Printf("Server %d Peer %d heartbeat started ticker %v time %v\n", p.server.me, p.ID, p.heartbeatInterval, time.Now())
 	p.flush()
 
 	ticker := time.Tick(p.heartbeatInterval)
@@ -100,7 +97,6 @@ func (p *Peer) heartbeat(c chan bool) {
 	for {
 		select {
 		case flush := <-stopChan:
-			//log.Printf("Server %d Peer %d heartbeat stopped time %v\n", p.server.me, p.ID, time.Now())
 			if flush {
 				p.flush()
 				return
@@ -110,9 +106,7 @@ func (p *Peer) heartbeat(c chan bool) {
 		case <-p.heartbeatChan:
 			p.flush()
 		case <-ticker:
-			//log.Printf("Peer %d Send heartbeat\n", p.ID)
 			p.flush()
-			//log.Printf("Peer %d Sent heartbeat\n", p.ID)
 		}
 	}
 }
@@ -122,7 +116,6 @@ func (p *Peer) flush() {
 	term := p.server.currentTerm
 
 	entries, prevLogTerm := p.server.log.GetEntriesAfter(prevLogIndex)
-	log.Printf("Server %d Peer %d Flush Entries: %+v\n", p.server.me, p.ID, entries)
 	if entries != nil {
 		p.sendAppendEntriesRequest(NewAppendEntriesArgs(term, prevLogIndex, prevLogTerm, p.server.log.CommitIndex(), p.server.ID(), entries))
 	} else {
@@ -133,7 +126,6 @@ func (p *Peer) flush() {
 func (p *Peer) sendInstallSnapshotRequest(args *InstallSnapshotArgs) error {
 	var reply InstallSnapshotReply
 	ch := make(chan bool)
-	fmt.Printf("Server %d Peer %d InstallSnapshot, Term: %d, LastIncludedIndex: %d, LastIncludedTerm: %d, Data: %d\n", p.server.me, p.ID, args.Term, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
 	go func(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 		ok := p.connection.Call("Raft.InstallSnapshot", args, reply)
 		ch <- ok
@@ -147,7 +139,6 @@ func (p *Peer) sendInstallSnapshotRequest(args *InstallSnapshotArgs) error {
 		return NetworkTimeout
 	}
 	p.Lock()
-	fmt.Printf("Server %d Peer %d InstallSnapshot return, Term: %d, prevLogIndex: %d, args.LastIncludedIndex: %d\n", p.server.me, p.ID, reply.Term, p.prevLogIndex, args.LastIncludedIndex)
 	p.prevLogIndex = args.LastIncludedIndex
 	p.Unlock()
 	return nil
@@ -156,7 +147,6 @@ func (p *Peer) sendInstallSnapshotRequest(args *InstallSnapshotArgs) error {
 func (p *Peer) sendAppendEntriesRequest(args *AppendEntriesArgs) error {
 	var reply AppendEntriesReply
 	ch := make(chan bool)
-	//p.server.sendAppendEntries(p.ID, args, &reply)
 	go func(rc chan bool, a *AppendEntriesArgs, r *AppendEntriesReply) {
 		ok := p.connection.Call("Raft.AppendEntries", a, r)
 		rc <- ok
@@ -171,7 +161,6 @@ func (p *Peer) sendAppendEntriesRequest(args *AppendEntriesArgs) error {
 	}
 	p.setLastActivity(time.Now())
 
-	fmt.Printf("Server %d Peer %d prevLogIndex: %d, term: %d, AppendEntriesReply: %+v\n", p.server.me, p.ID, p.prevLogIndex, p.server.currentTerm, reply)
 	p.Lock()
 	if reply.Success {
 		if len(args.Entries) > 0 {
@@ -202,16 +191,13 @@ func (p *Peer) sendRequestVote(args *RequestVoteArgs, c chan *RequestVoteReply) 
 	var reply RequestVoteReply
 	ch := make(chan bool)
 	args.peer = p
-	log.Printf("Server %d Peer %d Send RequestVoteArgs: %+v\n", p.server.me, p.ID, args)
 	for i := 0; i < 3; i++ {
 		go func(rc chan bool, a *RequestVoteArgs, r *RequestVoteReply) {
 			ok := p.connection.Call("Raft.RequestVote", a, r)
-			log.Printf("Server %d Peer %d sendRequestVote, return %v, %+v\n", p.server.me, p.ID, ok, r)
 			rc <- ok
 		}(ch, args, &reply)
 		select {
 		case ok := <-ch:
-			log.Printf("Server %d Peer %d ch received %v\n", p.server.me, p.ID, ok)
 			if ok {
 				break
 			}
@@ -220,13 +206,11 @@ func (p *Peer) sendRequestVote(args *RequestVoteArgs, c chan *RequestVoteReply) 
 			}
 			continue
 		case <-time.After(100 * time.Millisecond):
-			log.Printf("Server %d Peer %d ch timedout %v\n", p.server.me, p.ID, args)
 			if i == 2 {
 				return NetworkTimeout
 			}
 		}
 	}
-	log.Printf("Server %d Peer %d return RequestVoteReply to ch: %+v\n", p.server.me, p.ID, reply)
 	c <- &reply
 	return nil
 }

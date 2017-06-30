@@ -273,7 +273,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) TakeSnapshot(state []byte, index int, term int) {
-	log.Printf("Server %d Log %p TakeSnapshot Request, Index: %d, Term: %d\n", rf.me, rf.log, index, term)
 	args := &TakeSnapshotArgs{
 		UpperLevelState: state,
 		Index:           index,
@@ -330,7 +329,6 @@ func (rf *Raft) processInstallSnapshot(args *InstallSnapshotArgs) (*InstallSnaps
 		rf.updateCurrentTerm(args.Term, args.LeaderID)
 	}
 	rf.persister.SaveSnapshot(args.Data)
-	log.Printf("Server %d processInstallSnapshot, Log: %p, LastIncludedIndex: %d, LastIncludedTerm: %d\n", rf.me, rf.log, args.LastIncludedIndex, args.LastIncludedTerm)
 	rf.log.Compact(args.LastIncludedIndex, args.LastIncludedTerm)
 	rf.persist()
 
@@ -380,7 +378,6 @@ func (rf *Raft) processRequestVote(args *RequestVoteArgs) (*RequestVoteReply, bo
 	}
 
 	lastIndex, lastTerm := rf.log.LastInfo()
-	log.Printf("Server %d processRequestVote, votedFor: %d, lastIndex: %d, lastTerm: %d, args.LastLogIndex: %d, args.LastLogTerm: %d\n", rf.me, rf.votedFor, lastIndex, lastTerm, args.LastLogIndex, args.LastLogTerm)
 	if lastTerm > args.LastLogTerm || (lastTerm == args.LastLogTerm && lastIndex > args.LastLogIndex) {
 		return NewRequestVoteReply(rf.currentTerm, false), false
 	}
@@ -405,70 +402,10 @@ func (rf *Raft) AddPeer(id int) error {
 	}
 	if rf.me != id {
 		peer := NewPeer(rf, id, rf.heartbeatInterval)
-		//if rf.State() == Leader {
-		//	peer.startHeartbeat()
-		//}
 		rf.peers[id] = peer
 	}
 	return nil
 }
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-//func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-//	var ch chan bool
-//	var ok bool
-//	go func(c chan bool, ok *bool, a *RequestVoteArgs, r *RequestVoteReply) {
-//		*ok = rf.connections[server].Call("Raft.RequestVote", args, reply)
-//		ch <- true
-//	}(ch, &ok, args, reply)
-//	select {
-//	case <-ch:
-//	case <-time.After(100 * time.Millisecond):
-//	}
-//	return ok
-//}
-//
-//func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-//	var ch chan bool
-//	var ok bool
-//	go func(c chan bool, ok *bool, a *AppendEntriesArgs, r *AppendEntriesReply) {
-//		*ok = rf.connections[server].Call("Raft.AppendEntries", a, r)
-//		ch <- true
-//	}(ch, &ok, args, reply)
-//	select {
-//	case <-ch:
-//	case <-time.After(100 * time.Millisecond):
-//	}
-//	return ok
-//}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -533,7 +470,6 @@ func (rf *Raft) updateCurrentTerm(term int, leader int) {
 		}
 	}
 	if rf.state != Follower {
-		log.Printf("Server %d updateCurrentTerm setState(Follower)\n", rf.me)
 		rf.setState(Follower)
 	}
 
@@ -564,7 +500,6 @@ func (rf *Raft) start(value interface{}) (interface{}, error) {
 		return nil, StopError
 	}
 	event := &Event{target: value, notifyStart: make(chan interface{}, 1), c: make(chan error, 1)}
-	log.Printf("Server %d send start event to loop %+v\n", rf.me, event)
 	select {
 	case rf.c <- event:
 	case <-rf.stopped:
@@ -576,7 +511,6 @@ func (rf *Raft) start(value interface{}) (interface{}, error) {
 	case err := <-event.c:
 		return nil, err
 	case entry := <-event.notifyStart:
-		log.Printf("Server %d received start event notification: %+v\n", rf.me, entry)
 		return entry, nil
 	}
 }
@@ -586,16 +520,13 @@ func (rf *Raft) send(value interface{}) (interface{}, error) {
 		return nil, StopError
 	}
 	event := &Event{target: value, notifyStart: nil, c: make(chan error, 1)}
-	log.Printf("Server %d send event to loop %+v\n", rf.me, event)
 	select {
 	case rf.c <- event:
 	case <-rf.stopped:
-		log.Printf("Server %d Stopped\n", rf.me)
 		return nil, StopError
 	}
 	select {
 	case <-rf.stopped:
-		log.Printf("Server %d Stopped\n", rf.me)
 		return nil, StopError
 	case err := <-event.c:
 		return event.returnValue, err
@@ -629,7 +560,6 @@ func (rf *Raft) PersistStateSize() int {
 func (rf *Raft) followerLoop() {
 	timeoutChan := afterBetween(rf.ElectionTimeout(), rf.ElectionTimeout()*2)
 
-	//log.Printf("Server %d Enter followerLoop\n", rf.me)
 	for rf.State() == Follower {
 		var err error
 		update := false
@@ -640,24 +570,19 @@ func (rf *Raft) followerLoop() {
 		case e := <-rf.c:
 			switch args := e.target.(type) {
 			case *AppendEntriesArgs:
-				log.Printf("Server %d processing AppendEntriesArgs %+v\n", rf.me, args)
 				e.returnValue, update = rf.processAppendEntries(args)
-				log.Printf("Server %d processAppendEntries return, update: %v, value: %+v\n", rf.me, update, e.returnValue)
 			case *TakeSnapshotArgs:
 				rf.processTakeSnapshot(args)
 			case *InstallSnapshotArgs:
-				fmt.Printf("Server %d received InstallSnapshotArgs, Term: %d, LastIncludedIndex: %d, LastIncludedTerm: %d\n", rf.me, args.Term, args.LastIncludedIndex, args.LastIncludedTerm)
 				e.returnValue, _ = rf.processInstallSnapshot(args)
 			case *RequestVoteArgs:
 				e.returnValue, _ = rf.processRequestVote(args)
-				//log.Printf("Server %d processRequestVote result: %v\n", rf.me, e.returnValue)
 			default:
 				err = NotLeaderError
 			}
 			e.c <- err
 		case <-timeoutChan:
 			if rf.promotable() {
-				log.Printf("Server %d timeout setState(Candidate)\n", rf.me)
 				rf.setState(Candidate)
 			} else {
 				update = true
@@ -677,7 +602,6 @@ func (rf *Raft) candidateLoop() {
 	var timeoutChan <-chan time.Time
 	var replyChan chan *RequestVoteReply
 
-	//log.Printf("Server %d Enter candidateLoop\n", rf.me)
 	for rf.State() == Candidate {
 		if doVote {
 			rf.currentTerm++
@@ -696,7 +620,6 @@ func (rf *Raft) candidateLoop() {
 		}
 
 		if votesGranted == rf.QuorumSize() {
-			log.Printf("Server %d votesGranted: %d\n", rf.me, votesGranted)
 			rf.setState(Leader)
 			return
 		}
@@ -706,26 +629,20 @@ func (rf *Raft) candidateLoop() {
 			rf.setState(Stopped)
 			return
 		case reply := <-replyChan:
-			log.Printf("Server %d RequestVoteReply: %v\n", rf.me, reply)
 			if success := rf.processRequestVoteReply(reply); success {
 				votesGranted++
 			}
 		case e := <-rf.c:
-			//log.Printf("Server %d candidateLoop Received Event: %v\n", rf.me, e)
 			var err error
 			switch args := e.target.(type) {
-			case *AppendEntriesReply:
-				log.Printf("Server %d Candidate Received AppendEntriesReply: %+v\n", rf.me, args)
 			case *AppendEntriesArgs:
 				e.returnValue, _ = rf.processAppendEntries(args)
 			case *TakeSnapshotArgs:
 				rf.processTakeSnapshot(args)
 			case *InstallSnapshotArgs:
-				fmt.Printf("Server %d CandidateLoop received InstallSnapshotArgs, Term: %d, LastIncludedIndex: %d, LastIncludedTerm: %d\n", rf.me, args.Term, args.LastIncludedIndex, args.LastIncludedTerm)
 				e.returnValue, _ = rf.processInstallSnapshot(args)
 			case *RequestVoteArgs:
 				e.returnValue, _ = rf.processRequestVote(args)
-				//log.Printf("Server %d processRequestVote result: %v\n", rf.me, e.returnValue)
 			case interface{}:
 				err = NotLeaderError
 			}
@@ -740,15 +657,8 @@ func (rf *Raft) leaderLoop() {
 	logIndex, _ := rf.log.LastInfo()
 	for _, peer := range rf.peers {
 		peer.setPrevLogIndex(logIndex)
-		log.Printf("Server %d startHeartbeat Peer %d\n", rf.me, peer.ID)
 		peer.startHeartbeat()
 	}
-
-	//rf.routineGroup.Add(1)
-	//go func() {
-	//	defer rf.routineGroup.Done()
-	//	rf.Do(NOPCommand{})
-	//}()
 
 	for rf.State() == Leader {
 		var err error
@@ -760,7 +670,6 @@ func (rf *Raft) leaderLoop() {
 			rf.setState(Stopped)
 			return
 		case e := <-rf.c:
-			//log.Printf("Server %d leaderLoop Received Event: %v\n", rf.me, e)
 			switch args := e.target.(type) {
 			case *AppendEntriesArgs:
 				rf.processAppendEntries(args)
@@ -773,13 +682,11 @@ func (rf *Raft) leaderLoop() {
 			case *InstallSnapshotArgs:
 				e.returnValue, _ = rf.processInstallSnapshot(args)
 			case interface{}:
-				log.Printf("Server %d received command: %+v\n", rf.me, args)
 				rf.processCommand(args, e)
 				continue
 			}
 			e.c <- err
 		}
-		log.Printf("Server %d Leader New State: %s\n", rf.me, rf.State())
 	}
 	rf.syncedPeer = nil
 }
@@ -792,7 +699,6 @@ func (rf *Raft) processCommand(command interface{}, e *Event) (*LogEntry, error)
 	defer rf.persist()
 
 	entry := rf.log.CreateEntry(rf.currentTerm, command, e)
-	log.Printf("Server %d CreateEntry: %+v\n", rf.me, entry)
 	if err := rf.log.AppendEntry(entry); err != nil {
 		if e != nil {
 			e.c <- err
@@ -818,9 +724,7 @@ func (rf *Raft) processCommand(command interface{}, e *Event) (*LogEntry, error)
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	defer rf.persist()
-	log.Printf("Server %d Received AppendEntriesArgs %+v\n", rf.me, args)
 	ret, _ := rf.send(args)
-	log.Printf("Server %d Received AppendEntriesReply %+v\n", rf.me, ret)
 	r, _ := ret.(*AppendEntriesReply)
 	if r != nil {
 		*reply = *r
@@ -828,14 +732,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) processAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
-	log.Printf("Server %d processAppendEntries, args.Term: %d, rf.currentTerm: %d\n", rf.me, args.Term, rf.currentTerm)
 	if args.Term < rf.currentTerm {
-		log.Printf("Server %d processAppendEntries, args.Term < rf.currentTerm, %d < %d\n", rf.me, args.Term, rf.currentTerm)
 		return NewAppendEntriesReply(rf.currentTerm, false, rf.log.CurrentIndex(), rf.log.CommitIndex()), false
 	}
 	if args.Term == rf.currentTerm {
 		if rf.state == Candidate {
-			log.Printf("Server %d processAppendEntries setState(Follower)\n", rf.me)
 			rf.setState(Follower)
 		}
 		rf.leader = args.LeaderID
@@ -843,24 +744,19 @@ func (rf *Raft) processAppendEntries(args *AppendEntriesArgs) (*AppendEntriesRep
 		rf.updateCurrentTerm(args.Term, args.LeaderID)
 	}
 	if err := rf.log.Truncate(args.PrevLogIndex, args.PrevLogTerm); err != nil {
-		log.Printf("Server %d processAppendEntries, TuncateLog Error: %v\n", rf.me, err)
 		return NewAppendEntriesReply(rf.currentTerm, false, rf.log.CurrentIndex(), rf.log.CommitIndex()), true
 	}
 	if err := rf.log.AppendEntries(args.Entries); err != nil {
-		log.Printf("Server %d processAppendEntries, AppendEntries Error: %v\n", rf.me, err)
 		return NewAppendEntriesReply(rf.currentTerm, false, rf.log.CurrentIndex(), rf.log.CommitIndex()), true
 	}
 	if err := rf.log.SetCommitIndex(args.CommitIndex); err != nil {
-		log.Printf("Server %d processAppendEntries, SetCommitIndex Error: %v\n", rf.me, err)
 		return NewAppendEntriesReply(rf.currentTerm, false, rf.log.CurrentIndex(), rf.log.CommitIndex()), true
 	}
 	return NewAppendEntriesReply(rf.currentTerm, true, rf.log.CurrentIndex(), rf.log.CommitIndex()), true
 }
 
 func (rf *Raft) processAppendEntriesReply(reply *AppendEntriesReply) {
-	log.Printf("Server %d processAppendEntriesReply, reply: %+v, rf.currentTerm: %d\n", rf.me, reply, rf.Term())
 	if reply.Term > rf.Term() {
-		log.Printf("Server %d processAppendEntriesReply, reply.Term > rf.Term, reply: %+v\n", rf.me, reply)
 		rf.updateCurrentTerm(reply.Term, -1)
 	}
 	if !reply.Success {
@@ -869,17 +765,12 @@ func (rf *Raft) processAppendEntriesReply(reply *AppendEntriesReply) {
 	if reply.Append == true {
 		rf.syncedPeer[reply.Peer] = true
 	}
-	//if len(rf.syncedPeer) < rf.QuorumSize() {
-	//	log.Printf("Server %d processAppendEntriesReply, syncedPeer: %v, QuorumSize(): %d\n", rf.me, rf.syncedPeer, rf.QuorumSize())
-	//	return
-	//}
 
 	var indices []int
 	indices = append(indices, rf.log.CurrentIndex())
 	for _, peer := range rf.peers {
 		indices = append(indices, peer.getPrevLogIndex())
 	}
-	log.Printf("Server %d processAppendEntriesReply, indices: %v, Quorum-1: %d, committedIndex: %d\n", rf.me, indices, rf.QuorumSize()-1, rf.log.commitIndex)
 	sort.Sort(sort.Reverse(sort.IntSlice(indices)))
 	commitIndex := indices[rf.QuorumSize()-1]
 	committedIndex := rf.log.commitIndex
@@ -908,7 +799,7 @@ func (rf *Raft) Init() {
 		}
 		return entry, nil
 	}
-	rf.log.Open() //TODO: restore log
+	rf.log.Open()
 	rf.restoreSnapshot()
 	rf.readPersist(rf.persister.ReadRaftState())
 	_, rf.currentTerm = rf.log.LastInfo()
@@ -918,8 +809,6 @@ func (rf *Raft) Init() {
 	for i := range rf.connections {
 		rf.AddPeer(i)
 	}
-
-	log.Printf("Server %d Restarted\n", rf.me)
 
 	rf.routineGroup.Add(1)
 	go func() {
