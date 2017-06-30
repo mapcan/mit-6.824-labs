@@ -164,7 +164,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.notifyCommit = make(map[int]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 	go func() {
@@ -197,18 +196,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 					ch <- op
 					DPrintf("Server %d, Send index %d to Channel %v", kv.me, msg.Index, ch)
 				}
-				if kv.maxraftstate != -1 && kv.rf.PersistStateSize() > kv.maxraftstate {
+				if kv.maxraftstate != -1 && persister.RaftStateSize() > kv.maxraftstate && kv.rf != nil {
 					buffer := new(bytes.Buffer)
 					encoder := gob.NewEncoder(buffer)
 					encoder.Encode(kv.database)
 					encoder.Encode(kv.done)
 					data := buffer.Bytes()
-					go kv.rf.TakeSnapshot(data, msg.Index)
+					go kv.rf.TakeSnapshot(data, msg.Index, msg.Term)
 				}
 				kv.mu.Unlock()
 			}
 		}
 	}()
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	return kv
 }

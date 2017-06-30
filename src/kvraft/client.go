@@ -97,7 +97,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	request.Op = op
 	ck.mu.Unlock()
 	for {
-		for i, server := range ck.servers {
+		for _, server := range ck.servers {
 			var reply PutAppendReply
 			ok := server.Call("RaftKV.PutAppend", &request, &reply)
 			if ok && !reply.WrongLeader {
