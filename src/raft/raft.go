@@ -80,40 +80,6 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
-type TakeSnapshotArgs struct {
-	UpperLevelState []byte
-	Index           int
-	Term            int
-}
-
-type InstallSnapshotArgs struct {
-	Term              int
-	LeaderID          int
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	Data              []byte
-}
-
-func NewInstallSnapshotArgs(term int, leaderID int, lastIncludedIndex int, lastIncludedTerm int, data []byte) *InstallSnapshotArgs {
-	return &InstallSnapshotArgs{
-		Term:              term,
-		LeaderID:          leaderID,
-		LastIncludedIndex: lastIncludedIndex,
-		LastIncludedTerm:  lastIncludedTerm,
-		Data:              data,
-	}
-}
-
-func NewInstallSnapshotReply(term int) *InstallSnapshotReply {
-	return &InstallSnapshotReply{
-		Term: term,
-	}
-}
-
-type InstallSnapshotReply struct {
-	Term int
-}
-
 type Command interface {
 }
 
@@ -159,7 +125,6 @@ type Event struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
@@ -211,86 +176,6 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.log)
-}
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	peer         *Peer
-	Term         int
-	LastLogIndex int
-	LastLogTerm  int
-	CandidateID  int
-}
-
-func NewRequestVoteArgs(term int, candidateID int, lastLogIndex int, lastLogTerm int) *RequestVoteArgs {
-	return &RequestVoteArgs{
-		Term:         term,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
-		CandidateID:  candidateID,
-	}
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	peer        *Peer
-	Term        int
-	VoteGranted bool
-}
-
-func NewRequestVoteReply(term int, voteGranted bool) *RequestVoteReply {
-	return &RequestVoteReply{
-		Term:        term,
-		VoteGranted: voteGranted,
-	}
-
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	PrevLogIndex int
-	PrevLogTerm  int
-	CommitIndex  int
-	LeaderID     int
-	Entries      []*LogEntry
-}
-
-type AppendEntriesReply struct {
-	Term        int
-	Index       int
-	CommitIndex int
-	Success     bool
-	Peer        int
-	Append      bool
-}
-
-func NewAppendEntriesArgs(term int, prevLogIndex int, prevLogTerm int, commitIndex int, leaderID int, entries []*LogEntry) *AppendEntriesArgs {
-	args := &AppendEntriesArgs{
-		Term:         term,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		CommitIndex:  commitIndex,
-		LeaderID:     leaderID,
-		Entries:      entries,
-	}
-	return args
-}
-
-func NewAppendEntriesReply(term int, success bool, index int, commitIndex int) *AppendEntriesReply {
-	return &AppendEntriesReply{
-		Term:        term,
-		Index:       index,
-		Success:     success,
-		CommitIndex: commitIndex,
-	}
 }
 
 func (rf *Raft) ID() int {
