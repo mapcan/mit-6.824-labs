@@ -5,6 +5,7 @@ import "raft"
 import "labrpc"
 import "sync"
 import "time"
+import "sync/atomic"
 import "encoding/gob"
 
 type ShardMaster struct {
@@ -13,8 +14,10 @@ type ShardMaster struct {
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
 	done         map[string]int64
-	notifyCommit map[int]chan Op
 	configs      []Config // indexed by config num
+	stopCh       chan bool
+	stopped      int32
+	routineGroup sync.WaitGroup
 }
 
 const (
@@ -33,72 +36,24 @@ type Op struct {
 	Shard    int
 	GID      int
 	Num      int
+	c        chan error
 }
 
-func (sm *ShardMaster) equalOp(op1 Op, op2 Op) bool {
-	//if op1.Sequence != op2.Sequence {
-	//	return false
-	//}
-	if op1.Command != op2.Command {
-		return false
-	}
-	if op1.Shard != op2.Shard {
-		return false
-	}
-	if op1.GID != op2.GID {
-		return false
-	}
-	if op1.Num != op2.Num {
-		return false
-	}
-	if len(op1.GIDs) != len(op2.GIDs) {
-		return false
-	}
-	for i, GID1 := range op1.GIDs {
-		if GID1 != op2.GIDs[i] {
-			return false
-		}
-	}
-	if len(op1.Servers) != len(op2.Servers) {
-		return false
-	}
-	for k1, v1 := range op1.Servers {
-		v2, ok := op2.Servers[k1]
-		if !ok {
-			return false
-		}
-		if len(v1) != len(v2) {
-			return false
-		}
-		for i, vv1 := range v1 {
-			if vv1 != v2[i] {
-				return false
-			}
-		}
-	}
-	return true
+func (sm *ShardMaster) Stopped() bool {
+	return atomic.LoadInt32(&sm.stopped) == 1
+}
+func (sm *ShardMaster) SetStop() {
+	atomic.StoreInt32(&sm.stopped, 1)
 }
 
-func (sm *ShardMaster) appendLog(cmd Op) bool {
-	index, _, isLeader := sm.rf.Start(cmd)
+func (sm *ShardMaster) appendLog(op Op) bool {
+	_, _, isLeader := sm.rf.Start(op)
 	if !isLeader {
 		return false
 	}
-
-	sm.mu.Lock()
-	ch, ok := sm.notifyCommit[index]
-	if !ok {
-		ch = make(chan Op, 1)
-		sm.notifyCommit[index] = ch
-	}
-	sm.mu.Unlock()
-
 	select {
-	case op := <-ch:
-		sm.mu.Lock()
-		delete(sm.notifyCommit, index)
-		sm.mu.Unlock()
-		return sm.equalOp(cmd, op)
+	case err := <-op.c:
+		return err == nil
 	case <-time.After(1000 * time.Millisecond):
 		return false
 	}
@@ -204,6 +159,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		Sequence: args.Sequence,
 		Command:  Join,
 		Servers:  args.Servers,
+		c:        make(chan error),
 	}
 	ok := sm.appendLog(cmd)
 	if ok {
@@ -236,6 +192,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 		Sequence: args.Sequence,
 		Command:  Leave,
 		GIDs:     args.GIDs,
+		c:        make(chan error),
 	}
 	ok := sm.appendLog(cmd)
 	if ok {
@@ -259,6 +216,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 		Command:  Move,
 		Shard:    args.Shard,
 		GID:      args.GID,
+		c:        make(chan error),
 	}
 	ok := sm.appendLog(cmd)
 	if ok {
@@ -289,6 +247,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		Sequence: args.Sequence,
 		Command:  Query,
 		Num:      args.Num,
+		c:        make(chan error),
 	}
 	ok := sm.appendLog(cmd)
 	if ok {
@@ -307,8 +266,14 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 // turn off debug output from this instance.
 //
 func (sm *ShardMaster) Kill() {
-	sm.rf.Kill()
 	// Your code here, if desired.
+	if sm.Stopped() {
+		return
+	}
+	close(sm.stopCh)
+	sm.routineGroup.Wait()
+	sm.SetStop()
+	sm.rf.Kill()
 }
 
 // needed by shardkv tester
@@ -319,6 +284,26 @@ func (sm *ShardMaster) Raft() *raft.Raft {
 func (sm *ShardMaster) detectDuplicate(clientID string, sequence int64) bool {
 	seq, ok := sm.done[clientID]
 	return ok && seq >= sequence
+}
+
+func (sm *ShardMaster) loop() {
+	for {
+		select {
+		case <-sm.stopCh:
+			sm.SetStop()
+			return
+		case msg := <-sm.applyCh:
+			op := msg.Command.(Op)
+			sm.mu.Lock()
+			if !sm.detectDuplicate(op.ClientID, op.Sequence) {
+				sm.apply(op)
+			}
+			sm.mu.Unlock()
+			if op.c != nil {
+				op.c <- nil
+			}
+		}
+	}
 }
 
 //
@@ -334,33 +319,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.configs = make([]Config, 1)
 	sm.configs[0].Num = 0
 	sm.configs[0].Groups = map[int][]string{}
+	sm.done = make(map[string]int64)
 
 	gob.Register(Op{})
 	sm.applyCh = make(chan raft.ApplyMsg)
-	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
+	sm.stopCh = make(chan bool)
 
-	// Your code here.
-	sm.notifyCommit = make(map[int]chan Op)
-	sm.done = make(map[string]int64)
-
+	sm.routineGroup.Add(1)
 	go func() {
-		for {
-			msg := <-sm.applyCh
-			if msg.UseSnapshot {
-			} else {
-				op := msg.Command.(Op)
-				sm.mu.Lock()
-				if !sm.detectDuplicate(op.ClientID, op.Sequence) {
-					sm.apply(op)
-				}
-				ch, ok := sm.notifyCommit[msg.Index]
-				if ok {
-					ch <- op
-				}
-				sm.mu.Unlock()
-			}
-		}
+		defer sm.routineGroup.Done()
+		sm.loop()
 	}()
 
+	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 	return sm
 }

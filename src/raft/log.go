@@ -180,7 +180,7 @@ func (log *Log) SetCommitIndex(index int) error {
 		return nil
 	}
 	for i := log.commitIndex + 1; i <= index; i++ {
-		entry := log.entries[i-log.startIndex-1]
+		entry := log.entries[i-log.startIndex-1] //TODO: fix index out of range
 		log.commitIndex = entry.Index
 		returnValue, err := log.apply(entry)
 		if entry.event != nil {
