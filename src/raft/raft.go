@@ -344,17 +344,17 @@ func (rf *Raft) processTakeSnapshot(args *TakeSnapshotArgs) {
 	state := args.UpperLevelState
 	index := args.Index
 	term := args.Term
-	lastIncludedTerm, lastIncludedIndex, err := rf.log.Compact(index, term)
-	if err != nil {
-		return
-	}
 	buffer := new(bytes.Buffer)
 	encoder := gob.NewEncoder(buffer)
-	encoder.Encode(lastIncludedIndex)
-	encoder.Encode(lastIncludedTerm)
+	encoder.Encode(index)
+	encoder.Encode(term)
 	data := buffer.Bytes()
 	data = append(data, state...)
 	rf.persister.SaveSnapshot(data)
+	_, _, err := rf.log.Compact(index, term)
+	if err != nil {
+		return
+	}
 	rf.persist()
 }
 
@@ -696,7 +696,7 @@ func (rf *Raft) Do(command interface{}) (interface{}, error) {
 }
 
 func (rf *Raft) processCommand(command interface{}, e *Event) (*LogEntry, error) {
-	defer rf.persist()
+	//defer rf.persist()
 
 	entry := rf.log.CreateEntry(rf.currentTerm, command, e)
 	if err := rf.log.AppendEntry(entry); err != nil {
@@ -705,6 +705,7 @@ func (rf *Raft) processCommand(command interface{}, e *Event) (*LogEntry, error)
 		}
 		return entry, err
 	}
+	rf.persist()
 	rf.syncedPeer[rf.me] = true
 	if len(rf.peers) == 0 {
 		commitIndex := rf.log.CurrentIndex()
@@ -723,7 +724,7 @@ func (rf *Raft) processCommand(command interface{}, e *Event) (*LogEntry, error)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	defer rf.persist()
+	//defer rf.persist()
 	ret, _ := rf.send(args)
 	r, _ := ret.(*AppendEntriesReply)
 	if r != nil {
@@ -749,6 +750,7 @@ func (rf *Raft) processAppendEntries(args *AppendEntriesArgs) (*AppendEntriesRep
 	if err := rf.log.AppendEntries(args.Entries); err != nil {
 		return NewAppendEntriesReply(rf.currentTerm, false, rf.log.CurrentIndex(), rf.log.CommitIndex()), true
 	}
+	rf.persist()
 	if err := rf.log.SetCommitIndex(args.CommitIndex); err != nil {
 		return NewAppendEntriesReply(rf.currentTerm, false, rf.log.CurrentIndex(), rf.log.CommitIndex()), true
 	}

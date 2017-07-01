@@ -3,12 +3,11 @@ package raftkv
 import (
 	"bytes"
 	"encoding/gob"
-	//"fmt"
 	"labrpc"
 	"log"
 	"raft"
 	"sync"
-	//"time"
+	"time"
 )
 
 const Debug = 0
@@ -45,6 +44,7 @@ type RaftKV struct {
 	c            chan *Event
 	state        string
 	routineGroup sync.WaitGroup
+	persister    *raft.Persister
 }
 
 func (rs *RaftKV) setState(state string) {
@@ -60,13 +60,13 @@ func (rs *RaftKV) Running() bool {
 }
 
 func (rs *RaftKV) Get(args *GetArgs, reply *GetReply) {
+	reply.WrongLeader = true
 	rs.send(args, reply)
 }
 
 func (rs *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	log.Printf("Server %d, Received PutAppendArgs: %+v\n", rs.me, args)
+	reply.WrongLeader = true
 	rs.send(args, reply)
-	log.Printf("Server %d, Processed PutAppend, Reply: %+v\n", rs.me, reply)
 }
 
 func (rs *RaftKV) State() string {
@@ -120,12 +120,13 @@ func (rs *RaftKV) send(value1 interface{}, value2 interface{}) error {
 	case <-rs.stopped:
 		return raft.StopError
 	}
-	log.Printf("Server %d Wait For Event.c %v\n", rs.me, event.c)
 	select {
 	case err := <-event.c:
 		return err
 	case <-rs.stopped:
 		return raft.StopError
+	case <-time.After(1000 * time.Millisecond):
+		return raft.CommandTimeoutError
 	}
 }
 
@@ -156,9 +157,13 @@ func (rs *RaftKV) recovery(snapshot []byte) error {
 
 func (rs *RaftKV) processGetArgs(a interface{}, r interface{}) {
 	var reply *GetReply
+	if a == nil {
+		return
+	}
 	args := a.(*GetArgs)
 	if r != nil {
 		reply = r.(*GetReply)
+		reply.WrongLeader = false
 	} else {
 		reply = nil
 	}
@@ -172,9 +177,13 @@ func (rs *RaftKV) processGetArgs(a interface{}, r interface{}) {
 
 func (rs *RaftKV) processPutAppendArgs(a interface{}, r interface{}) {
 	var reply *PutAppendReply
+	if a == nil {
+		return
+	}
 	args := a.(*PutAppendArgs)
 	if r != nil {
 		reply = r.(*PutAppendReply)
+		reply.WrongLeader = false
 	} else {
 		reply = nil
 	}
@@ -199,7 +208,6 @@ func (rs *RaftKV) processPutAppendArgs(a interface{}, r interface{}) {
 }
 
 func (rs *RaftKV) processApplyMsg(msg *raft.ApplyMsg) {
-	log.Printf("Server %d Received ApplyMsg: %+v\n", rs.me, msg)
 	if msg.UseSnapshot {
 		rs.recovery(msg.Snapshot)
 	} else {
@@ -211,17 +219,18 @@ func (rs *RaftKV) processApplyMsg(msg *raft.ApplyMsg) {
 			rs.processPutAppendArgs(args, event.returnValue)
 		}
 		if event.c != nil {
-			log.Printf("Server %d Event Processed, Send Event.c %v\n", rs.me, event.c)
 			event.c <- nil
+		}
+		if rs.maxraftstate != 1 && rs.persister.RaftStateSize() > rs.maxraftstate && rs.rf != nil {
+			data, _ := rs.save()
+			rs.rf.TakeSnapshot(data, msg.Index, msg.Term)
 		}
 	}
 }
 
-func (rs *RaftKV) processCommand(event *Event) {
-	//log.Printf("Server %d Send Raft Event: %+v\n", rs.me, event)
+func (rs *RaftKV) processEvent(event *Event) {
 	_, _, isLeader := rs.rf.Start(event)
 	if isLeader {
-		log.Printf("Server %d NotLeader, Event: %+v\n", rs.me, event)
 		return
 	}
 	switch event.Target.(type) {
@@ -235,7 +244,7 @@ func (rs *RaftKV) processCommand(event *Event) {
 	event.c <- raft.NotLeaderError
 }
 
-func (rs *RaftKV) loop() {
+func (rs *RaftKV) applyLoop() {
 	for {
 		select {
 		case <-rs.stopped:
@@ -243,9 +252,18 @@ func (rs *RaftKV) loop() {
 			return
 		case msg := <-rs.applyCh:
 			rs.processApplyMsg(&msg)
+		}
+	}
+}
+
+func (rs *RaftKV) eventLoop() {
+	for {
+		select {
+		case <-rs.stopped:
+			rs.setState(Stopped)
+			return
 		case event := <-rs.c:
-			//log.Printf("Server %d start processing Event: %+v\n", rs.me, event)
-			rs.processCommand(event)
+			rs.processEvent(event)
 		}
 	}
 }
@@ -262,16 +280,22 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		maxraftstate: maxraftstate,
 		kv:           NewKV(),
 		recorder:     NewRecorder(),
-		applyCh:      make(chan raft.ApplyMsg),
+		applyCh:      make(chan raft.ApplyMsg, 256),
 		stopped:      make(chan bool),
 		state:        Running,
 		c:            make(chan *Event, 256),
+		persister:    persister,
 	}
 
 	rs.routineGroup.Add(1)
 	go func() {
 		defer rs.routineGroup.Done()
-		rs.loop()
+		rs.eventLoop()
+	}()
+	rs.routineGroup.Add(1)
+	go func() {
+		defer rs.routineGroup.Done()
+		rs.applyLoop()
 	}()
 
 	rs.rf = raft.Make(servers, me, persister, rs.applyCh)
