@@ -37,16 +37,15 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	id       string
-	database map[string]string
-	done     map[string]int64
-	//notifyCommit   map[int]chan Op
+	id             string
+	database       map[string]string
+	done           map[string]int64
 	alive          int32
 	sequence       int64
 	config         shardmaster.Config
-	pulled         [shardmaster.NShards]int
-	pushed         [shardmaster.NShards]int
 	shardConfigNum [shardmaster.NShards]int
+	stopCh         chan bool
+	routineGroup   sync.WaitGroup
 }
 
 func (kv *ShardKV) detectDuplicate(clientID string, sequence int64) bool {
@@ -132,8 +131,17 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
-	kv.rf.Kill()
 	// Your code here, if desired.
+	if !kv.Alive() {
+		return
+	}
+	close(kv.stopCh)
+	kv.routineGroup.Wait()
+	atomic.StoreInt32(&kv.alive, 0)
+	kv.rf.Kill()
+}
+
+func (kv *ShardKV) setDead() {
 	atomic.StoreInt32(&kv.alive, 0)
 }
 
@@ -161,35 +169,6 @@ func (kv *ShardKV) PushState(args *PushStateArgs, reply *PushStateReply) {
 		return
 	}
 
-	reply.Err = OK
-}
-
-func (kv *ShardKV) PullState(args *PullStateArgs, reply *PullStateReply) {
-	op := Op{
-		ClientID:  "Local.PullState",
-		Sequence:  int64(args.ConfigNum),
-		Operation: "Pull",
-		c:         make(chan error, 1),
-	}
-	if !kv.appendLog(op) {
-		reply.WrongLeader = true
-		return
-	}
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	reply.Database = make(map[string]string)
-	for key, value := range kv.database {
-		if key2shard(key) == args.Shard {
-			reply.Database[key] = value
-		}
-	}
-
-	reply.Done = make(map[string]int64)
-	for clientID, sequence := range kv.done {
-		reply.Done[clientID] = sequence
-	}
 	reply.Err = OK
 }
 
@@ -233,38 +212,6 @@ func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardma
 	}
 }
 
-func (kv *ShardKV) pull(gid int, shard int) bool {
-	if kv.pulled[shard] >= kv.config.Num {
-		return true
-	}
-	for {
-		for _, server := range kv.config.Groups[gid] {
-			ck := kv.make_end(server)
-			args := PullStateArgs{
-				ConfigNum: kv.config.Num,
-				Shard:     shard,
-			}
-			reply := PullStateReply{}
-			ok := ck.Call("ShardKV.PullState", &args, &reply)
-			if ok && reply.WrongLeader {
-				continue
-			}
-			if ok && reply.Err == OK {
-				for key, value := range reply.Database {
-					kv.database[key] = value
-				}
-				for clientID, sequence := range reply.Done {
-					if sequence > kv.done[clientID] {
-						kv.done[clientID] = sequence
-					}
-				}
-				kv.pulled[shard] = kv.config.Num
-				return true
-			}
-		}
-	}
-}
-
 func (kv *ShardKV) apply(cmd Op) {
 	switch cmd.Operation {
 	case "Put":
@@ -293,6 +240,81 @@ func (kv *ShardKV) apply(cmd Op) {
 		kv.config = cmd.Config
 	}
 	kv.done[cmd.ClientID] = cmd.Sequence
+}
+
+func (kv *ShardKV) applyLoop() {
+	for {
+		select {
+		case <-kv.stopCh:
+			kv.setDead()
+			return
+		case msg := <-kv.applyCh:
+			if msg.UseSnapshot {
+				var lastIncludedIndex int
+				var lastIncludedTerm int
+				buffer := bytes.NewBuffer(msg.Snapshot)
+				decoder := gob.NewDecoder(buffer)
+				decoder.Decode(&lastIncludedIndex)
+				decoder.Decode(&lastIncludedTerm)
+				database := make(map[string]string)
+				done := make(map[string]int64)
+				decoder.Decode(&database)
+				decoder.Decode(&done)
+				kv.mu.Lock()
+				kv.database = database
+				kv.done = done
+				kv.mu.Unlock()
+			} else {
+				op := msg.Command.(Op)
+				kv.mu.Lock()
+				if !kv.detectDuplicate(op.ClientID, op.Sequence) {
+					kv.apply(op)
+				}
+				if op.c != nil {
+					op.c <- nil
+				}
+				if kv.maxraftstate != -1 && kv.rf != nil && kv.rf.PersistStateSize() > kv.maxraftstate {
+					buffer := new(bytes.Buffer)
+					encoder := gob.NewEncoder(buffer)
+					encoder.Encode(kv.database)
+					encoder.Encode(kv.done)
+					data := buffer.Bytes()
+					go kv.rf.TakeSnapshot(data, msg.Index, msg.Term)
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (kv *ShardKV) configLoop() {
+	ticker := time.Tick(100 * time.Millisecond)
+	for {
+		select {
+		case <-kv.stopCh:
+			kv.setDead()
+			return
+		case <-ticker:
+			ck := shardmaster.MakeClerk(kv.masters)
+			config := ck.Query(-1)
+			kv.mu.Lock()
+			curNum := kv.config.Num
+			kv.mu.Unlock()
+			for n := curNum + 1; n <= config.Num; n++ {
+				c := ck.Query(n)
+				cmd := Op{
+					ClientID:  "Server.Reconfig",
+					Sequence:  int64(n),
+					Operation: "Reconfig",
+					Config:    c,
+					c:         make(chan error, 1),
+				}
+				if !kv.appendLog(cmd) {
+					break
+				}
+			}
+		}
+	}
 }
 
 //
@@ -342,79 +364,26 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.id, _ = newUUID()
 	kv.sequence = 0
 	atomic.StoreInt32(&kv.alive, 1)
+	kv.stopCh = make(chan bool)
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	for i := 0; i < shardmaster.NShards; i++ {
-		kv.pulled[i] = 0
-		kv.pushed[i] = 0
 		kv.shardConfigNum[i] = 0
 	}
 
+	kv.routineGroup.Add(1)
 	go func() {
-		for kv.Alive() {
-			msg := <-kv.applyCh
-			if msg.UseSnapshot {
-				var lastIncludedIndex int
-				var lastIncludedTerm int
-				buffer := bytes.NewBuffer(msg.Snapshot)
-				decoder := gob.NewDecoder(buffer)
-				decoder.Decode(&lastIncludedIndex)
-				decoder.Decode(&lastIncludedTerm)
-				database := make(map[string]string)
-				done := make(map[string]int64)
-				decoder.Decode(&database)
-				decoder.Decode(&done)
-				kv.mu.Lock()
-				kv.database = database
-				kv.done = done
-				kv.mu.Unlock()
-			} else {
-				op := msg.Command.(Op)
-				kv.mu.Lock()
-				if !kv.detectDuplicate(op.ClientID, op.Sequence) {
-					kv.apply(op)
-				}
-				if op.c != nil {
-					op.c <- nil
-				}
-				if kv.maxraftstate != -1 && kv.rf.PersistStateSize() > kv.maxraftstate {
-					buffer := new(bytes.Buffer)
-					encoder := gob.NewEncoder(buffer)
-					encoder.Encode(kv.database)
-					encoder.Encode(kv.done)
-					data := buffer.Bytes()
-					go kv.rf.TakeSnapshot(data, msg.Index, msg.Term)
-				}
-				kv.mu.Unlock()
-			}
-		}
+		defer kv.routineGroup.Done()
+		kv.applyLoop()
 	}()
 
+	kv.routineGroup.Add(1)
 	go func() {
-		for kv.Alive() {
-			ck := shardmaster.MakeClerk(masters)
-			config := ck.Query(-1)
-			kv.mu.Lock()
-			curNum := kv.config.Num
-			kv.mu.Unlock()
-			for n := curNum + 1; n <= config.Num; n++ {
-				c := ck.Query(n)
-				cmd := Op{
-					ClientID:  "Server.Reconfig",
-					Sequence:  int64(n),
-					Operation: "Reconfig",
-					Config:    c,
-					c:         make(chan error, 1),
-				}
-				if !kv.appendLog(cmd) {
-					break
-				}
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+		defer kv.routineGroup.Done()
+		kv.configLoop()
 	}()
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
