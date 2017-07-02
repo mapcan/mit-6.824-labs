@@ -271,7 +271,6 @@ func (log *Log) Compact(index int, term int) (int, int, error) {
 	defer log.Unlock()
 
 	var entries []*LogEntry
-	//fmt.Printf("Server LogCompact, Index: %d, log.startIndex: %d, log.lastIndex: %d\n", index, log.startIndex, log.entries[len(log.entries)-1].Index)
 	if index >= log.InternalCurrentIndex() {
 		entries = make([]*LogEntry, 0)
 	} else if index < log.startIndex {
