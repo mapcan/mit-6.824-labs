@@ -9,7 +9,7 @@ import "encoding/gob"
 import "time"
 import "bytes"
 
-import "fmt"
+//import "fmt"
 
 type Op struct {
 	// Your definitions here.
@@ -55,13 +55,7 @@ func (kv *ShardKV) detectDuplicate(clientID string, sequence int64) bool {
 }
 
 func (kv *ShardKV) appendLog(cmd Op) bool {
-	//if cmd.Operation != "Reconfig" {
-	//	fmt.Printf("Server %d GID %d Num %d, Raft Start cmd: %v\n", kv.me, kv.gid, kv.config.Num, cmd)
-	//}
 	_, _, isLeader := kv.rf.Start(cmd)
-	//if cmd.Operation != "Reconfig" {
-	//	fmt.Printf("Server %d GID %d Num %d, Raft End cmd: %v\n", kv.me, kv.gid, kv.config.Num, cmd)
-	//}
 	if !isLeader {
 		return false
 	}
@@ -99,7 +93,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Lock()
 		reply.Value = kv.database[cmd.Key]
 		kv.done[cmd.ClientID] = cmd.Sequence
-		fmt.Printf("Server %d GID %d Num %d GET Key: %s, Value: %s\n", kv.me, kv.gid, kv.config.Num, cmd.Key, reply.Value)
 		kv.mu.Unlock()
 	}
 }
@@ -168,24 +161,6 @@ func (kv *ShardKV) PushState(args *PushStateArgs, reply *PushStateReply) {
 		return
 	}
 
-	//kv.mu.Lock()
-	//defer kv.mu.Unlock()
-
-	//if args.ConfigNum < kv.config.Num {
-	//	fmt.Printf("Server %d GID %d Num %d, WrongConfigNum, args.ConfigNum: %d, kv.config.Num: %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum, kv.config.Num)
-	//	//reply.Err = ErrWrongConfigNum
-	//	reply.Err = OK
-	//	return
-	//}
-
-	//for key, value := range args.Database {
-	//	kv.database[key] = value
-	//}
-	//for clientID, sequence := range args.Done {
-	//	if kv.done[clientID] < sequence {
-	//		kv.done[clientID] = sequence
-	//	}
-	//}
 	reply.Err = OK
 }
 
@@ -196,29 +171,18 @@ func (kv *ShardKV) PullState(args *PullStateArgs, reply *PullStateReply) {
 		Operation: "Pull",
 		c:         make(chan error, 1),
 	}
-	//fmt.Printf("Server %d GID %d Num %d, Begin AppendLog %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum)
 	if !kv.appendLog(op) {
 		reply.WrongLeader = true
-		//fmt.Printf("Server %d GID %d Num %d, End AppendLog %d WrongLeader\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum)
 		return
 	}
-	//fmt.Printf("Server %d GID %d Num %d, End AppendLog %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum)
 
-	//fmt.Printf("Server %d GID %d Num %d, Begin PullState %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
-	//if kv.config.Num < args.ConfigNum {
-	//	//reply.Err = ErrWrongConfigNum
-	//	reply.Err = OK
-	//	return
-	//}
 
 	reply.Database = make(map[string]string)
 	for key, value := range kv.database {
 		if key2shard(key) == args.Shard {
 			reply.Database[key] = value
-			fmt.Printf("Server %d GID %d Num %d, Migrate To Shard: %d, Num: %d, Key: %s, Value: %s, Key %s belongs to Shard %d\n", kv.me, kv.gid, kv.config.Num, args.Shard, args.ConfigNum, key, value, key, args.Shard)
 		}
 	}
 
@@ -227,7 +191,6 @@ func (kv *ShardKV) PullState(args *PullStateArgs, reply *PullStateReply) {
 		reply.Done[clientID] = sequence
 	}
 	reply.Err = OK
-	//fmt.Printf("Server %d GID %d Num %d, End PullState %d\n", kv.me, kv.gid, kv.config.Num, args.ConfigNum)
 }
 
 func (kv *ShardKV) makePushStateArgs(shard int, config *shardmaster.Config) *PushStateArgs {
@@ -259,9 +222,7 @@ func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardma
 		for _, server := range config.Groups[gid] {
 			ck := kv.make_end(server)
 			reply := PushStateReply{}
-			fmt.Printf("Server %d GID %d Num %d, Start migrate to Server %v, Shard: %d, Database: %v\n", kv.me, kv.gid, config.Num, server, shard, args.Database)
 			ok := ck.Call("ShardKV.PushState", args, &reply)
-			fmt.Printf("Server %d GID %d Num %d, Finish migrate to Server %v, Shard: %d, Reply: %v\n", kv.me, kv.gid, config.Num, server, shard, reply)
 			if ok && reply.WrongLeader {
 				continue
 			}
@@ -284,16 +245,12 @@ func (kv *ShardKV) pull(gid int, shard int) bool {
 				Shard:     shard,
 			}
 			reply := PullStateReply{}
-			fmt.Printf("Server %d GID %d Num %d, Start migrate from Server %v, Shard: %d\n", kv.me, kv.gid, kv.config.Num, server, shard)
 			ok := ck.Call("ShardKV.PullState", &args, &reply)
-			fmt.Printf("Server %d GID %d Num %d, Finish migrate from Server %v, Shard: %d, Reply: %v\n", kv.me, kv.gid, kv.config.Num, server, shard, reply.Database)
-			fmt.Printf("Server %d GID %d Num %d, PullState Reply: %v\n", kv.me, kv.gid, kv.config.Num, reply)
 			if ok && reply.WrongLeader {
 				continue
 			}
 			if ok && reply.Err == OK {
 				for key, value := range reply.Database {
-					fmt.Printf("Server %d GID %d Num %d, Overwrite database, Key: %s, Old Value: %s, New Value: %s\n", kv.me, kv.gid, kv.config.Num, key, kv.database[key], value)
 					kv.database[key] = value
 				}
 				for clientID, sequence := range reply.Done {
@@ -314,9 +271,7 @@ func (kv *ShardKV) apply(cmd Op) {
 		kv.database[cmd.Key] = cmd.Value
 	case "Append":
 		kv.database[cmd.Key] += cmd.Value
-		fmt.Printf("Server %d GID %d Num %d applied Append, Key: %s, Value: %s\n", kv.me, kv.gid, kv.config.Num, cmd.Key, kv.database[cmd.Key])
 	case "PushState":
-		fmt.Printf("Server %d GID %d Num %d applied PushState, State: %v\n", kv.me, kv.gid, kv.config.Num, cmd.Database)
 		for key, value := range cmd.Database {
 			kv.database[key] = value
 		}
@@ -326,7 +281,6 @@ func (kv *ShardKV) apply(cmd Op) {
 			}
 		}
 	case "Reconfig":
-		fmt.Printf("Server %d, GID: %d, Old Config: %d %v, New Config: %d %v\n", kv.me, kv.gid, kv.config.Num, kv.config.Shards, cmd.Config.Num, cmd.Config.Shards)
 		for shard, gid := range kv.config.Shards {
 			if gid == 0 || gid == cmd.Config.Shards[shard] {
 				continue
@@ -376,7 +330,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv := new(ShardKV)
 	kv.me = me
-	kv.maxraftstate = maxraftstate
+	//kv.maxraftstate = maxraftstate
+	kv.maxraftstate = -1
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.masters = masters
@@ -384,7 +339,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Your initialization code here.
 	kv.done = make(map[string]int64)
 	kv.database = make(map[string]string)
-	//kv.notifyCommit = make(map[int]chan Op)
 	kv.id, _ = newUUID()
 	kv.sequence = 0
 	atomic.StoreInt32(&kv.alive, 1)
@@ -393,14 +347,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	for i := 0; i < shardmaster.NShards; i++ {
 		kv.pulled[i] = 0
 		kv.pushed[i] = 0
 		kv.shardConfigNum[i] = 0
 	}
-
-	fmt.Printf("Server %d GID %d started\n", kv.me, kv.gid)
 
 	go func() {
 		for kv.Alive() {
@@ -414,27 +365,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 				decoder.Decode(&lastIncludedTerm)
 				database := make(map[string]string)
 				done := make(map[string]int64)
-				//var config shardmaster.Config
 				decoder.Decode(&database)
 				decoder.Decode(&done)
-				//decoder.Decode(&config)
 				kv.mu.Lock()
 				kv.database = database
 				kv.done = done
-				//kv.config = config
 				kv.mu.Unlock()
 			} else {
 				op := msg.Command.(Op)
 				kv.mu.Lock()
 				if !kv.detectDuplicate(op.ClientID, op.Sequence) {
 					kv.apply(op)
-				} else {
-					fmt.Printf("Server %d GID %d Num %d, apply PushState duplicate detected, ClientID: %s, Sequence: %d, Database: %v\n", kv.me, kv.gid, kv.config.Num, op.ClientID, op.Sequence, op.Database)
 				}
-				//ch, ok := kv.notifyCommit[msg.Index]
-				//if ok {
-				//	ch <- op
-				//}
 				if op.c != nil {
 					op.c <- nil
 				}
@@ -443,10 +385,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 					encoder := gob.NewEncoder(buffer)
 					encoder.Encode(kv.database)
 					encoder.Encode(kv.done)
-					//encoder.Encode(kv.config)
 					data := buffer.Bytes()
-					fmt.Printf("Server %d GID %d Num %d, Take Snapshot\n", kv.me, kv.gid, kv.config.Num)
-					go kv.rf.TakeSnapshot(data, msg.Index)
+					go kv.rf.TakeSnapshot(data, msg.Index, msg.Term)
 				}
 				kv.mu.Unlock()
 			}
@@ -469,11 +409,15 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 					Config:    c,
 					c:         make(chan error, 1),
 				}
-				kv.appendLog(cmd)
+				if !kv.appendLog(cmd) {
+					break
+				}
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}()
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	return kv
 }
