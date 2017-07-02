@@ -841,7 +841,7 @@ func Make(connections []*labrpc.ClientEnd, me int, persister *Persister, applyCh
 		me:                me,
 		c:                 make(chan *Event, 256),
 		electionTimeout:   DefaultEletionTimeout,
-		heartbeatInterval: DefaultEletionTimeout,
+		heartbeatInterval: DefaultHeartbeatInterval,
 		log:               NewLog(),
 		state:             Initialized,
 		stopped:           make(chan bool),
