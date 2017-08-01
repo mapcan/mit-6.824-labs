@@ -221,7 +221,7 @@ func (rs *RaftKV) processApplyMsg(msg *raft.ApplyMsg) {
 		if event.c != nil {
 			event.c <- nil
 		}
-		if rs.maxraftstate != 1 && rs.persister.RaftStateSize() > rs.maxraftstate && rs.rf != nil {
+		if rs.maxraftstate != -1 && rs.persister.RaftStateSize() > rs.maxraftstate && rs.rf != nil {
 			data, _ := rs.save()
 			rs.rf.TakeSnapshot(data, msg.Index, msg.Term)
 		}
