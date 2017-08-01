@@ -1,5 +1,7 @@
 package shardkv
 
+import "shardmaster"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running op-at-a-time paxos.
@@ -12,6 +14,7 @@ package shardkv
 const (
 	OK                = "OK"
 	ErrNoKey          = "ErrNoKey"
+	ErrOldShard       = "ErrOldShard"
 	ErrWrongGroup     = "ErrWrongGroup"
 	ErrWrongConfigNum = "ErrWrongConfigNum"
 )
@@ -49,6 +52,10 @@ type GetReply struct {
 	Value       string
 }
 
+type ConfigChangeArgs struct {
+	Config shardmaster.Config
+}
+
 type PullStateArgs struct {
 	ConfigNum int
 	Shard     int
@@ -64,15 +71,16 @@ type PullStateReply struct {
 }
 
 type PushStateArgs struct {
-	ConfigNum int
-	Shard     int
-	Database  map[string]string
-	Done      map[string]int64
-	ClientID  string
-	Sequence  int64
+	Sn       int
+	Clock    *ShardLogicalClock
+	Shard    *Shard
+	ClientID string
+	Sequence int64
 }
 
 type PushStateReply struct {
 	WrongLeader bool
 	Err         Err
+	Sn          int
+	Clock       *ShardLogicalClock
 }

@@ -9,25 +9,16 @@ import "encoding/gob"
 import "time"
 import "bytes"
 
-//import "fmt"
+import "fmt"
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	ClientID  string
-	Sequence  int64
-	Operation string
-	Key       string
-	Value     string
-	Config    shardmaster.Config
-	Database  map[string]string
-	Done      map[string]int64
-	c         chan error
+type Event struct {
+	Target      interface{}
+	returnValue interface{}
+	c           chan error
 }
 
 type ShardKV struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -37,90 +28,179 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	id             string
-	database       map[string]string
-	done           map[string]int64
-	alive          int32
-	sequence       int64
-	config         shardmaster.Config
-	shardConfigNum [shardmaster.NShards]int
-	stopCh         chan bool
-	routineGroup   sync.WaitGroup
-}
-
-func (kv *ShardKV) detectDuplicate(clientID string, sequence int64) bool {
-	seq, ok := kv.done[clientID]
-	return ok && seq >= sequence
-}
-
-func (kv *ShardKV) appendLog(cmd Op) bool {
-	_, _, isLeader := kv.rf.Start(cmd)
-	if !isLeader {
-		return false
-	}
-
-	select {
-	case <-cmd.c:
-		return true
-	}
+	id           string
+	sequence     int64
+	shardManager *ShardManager
+	alive        int32
+	config       shardmaster.Config
+	stopCh       chan bool
+	routineGroup sync.WaitGroup
+	persister    *raft.Persister
+	eventCh      chan *Event
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	cmd := Op{
-		ClientID:  args.ClientID,
-		Sequence:  args.Sequence,
-		Operation: "Get",
-		Key:       args.Key,
-		c:         make(chan error, 1),
-	}
-
-	kv.mu.Lock()
-	if kv.gid != kv.config.Shards[key2shard(args.Key)] {
-		reply.Err = ErrWrongGroup
-		kv.mu.Unlock()
-		return
-	}
-	kv.mu.Unlock()
-
-	ok := kv.appendLog(cmd)
-	if !ok {
-		reply.WrongLeader = true
-	} else {
-		reply.WrongLeader = false
-		reply.Err = OK
-		kv.mu.Lock()
-		reply.Value = kv.database[cmd.Key]
-		kv.done[cmd.ClientID] = cmd.Sequence
-		kv.mu.Unlock()
-	}
+	reply.WrongLeader = true
+	kv.send(args, reply)
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	cmd := Op{
-		ClientID:  args.ClientID,
-		Sequence:  args.Sequence,
-		Operation: args.Op,
-		Key:       args.Key,
-		Value:     args.Value,
-		c:         make(chan error, 1),
-	}
+	reply.WrongLeader = true
+	kv.send(args, reply)
+}
 
-	kv.mu.Lock()
-	if kv.gid != kv.config.Shards[key2shard(args.Key)] {
-		reply.Err = ErrWrongGroup
-		kv.mu.Unlock()
+func (kv *ShardKV) save() ([]byte, error) {
+	buffer := new(bytes.Buffer)
+	encoder := gob.NewEncoder(buffer)
+	encoder.Encode(kv.shardManager)
+	return buffer.Bytes(), nil
+}
+
+func (kv *ShardKV) recovery(snapshot []byte) error {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	buffer := bytes.NewBuffer(snapshot)
+	decoder := gob.NewDecoder(buffer)
+	decoder.Decode(&lastIncludedIndex)
+	decoder.Decode(&lastIncludedTerm)
+	shardManager := NewShardManager()
+	decoder.Decode(&shardManager)
+	kv.shardManager = shardManager
+	return nil
+}
+
+func (kv *ShardKV) processGetArgs(a interface{}, r interface{}) {
+	var reply *GetReply
+	if a == nil {
 		return
 	}
-	kv.mu.Unlock()
-
-	ok := kv.appendLog(cmd)
-	if ok {
-		reply.Err = OK
+	args := a.(*GetArgs)
+	if r != nil {
+		reply = r.(*GetReply)
+		reply.WrongLeader = false
 	} else {
-		reply.WrongLeader = true
-		reply.Err = "WrongLeader"
+		reply = nil
+	}
+	cid, key, seq := args.ClientID, args.Key, args.Sequence
+	sn := key2shard(key)
+	shard := kv.shardManager.GetShard(sn)
+	if shard != nil && reply != nil {
+		reply.Value = shard.Get(key)
+		reply.Err = OK
+		shard.recorder.Record(cid, seq)
+	}
+}
+
+func (kv *ShardKV) processPutAppendArgs(a interface{}, r interface{}) {
+	var reply *PutAppendReply
+	if a == nil {
+		return
+	}
+	args := a.(*PutAppendArgs)
+	if r != nil {
+		reply = r.(*PutAppendReply)
+		reply.WrongLeader = false
+	} else {
+		reply = nil
+	}
+	key, value, op, cid, seq := args.Key, args.Value, args.Op, args.ClientID, args.Sequence
+	sn := key2shard(key)
+	if kv.gid != kv.config.Shards[sn] {
+		reply.Err = ErrWrongGroup
+		return
+	}
+	shard := kv.shardManager.GetShard(sn)
+	if shard == nil {
+		newShard := NewShard(sn)
+		newClock := NewShardLogicalClock(kv.config.Num, kv.rf.Term())
+		kv.shardManager.AddShard(sn, newClock, newShard)
+		shard = newShard
+	}
+	if reply != nil {
+		switch op {
+		case "Put":
+			shard.Set(key, value)
+		case "Append":
+			v := shard.Get(key)
+			shard.Set(key, v+value)
+		}
+		newClock := NewShardLogicalClock(kv.config.Num, kv.rf.Term())
+		kv.shardManager.SetClock(sn, newClock)
+		reply.Err = OK
+	}
+	shard.recorder.Record(cid, seq)
+}
+
+func (kv *ShardKV) updateConfig() {
+	ck := shardmaster.MakeClerk(kv.masters)
+	config := ck.Query(-1)
+	curNum := kv.config.Num
+	for n := curNum + 1; n <= config.Num; n++ {
+		c := ck.Query(n)
+		args := &ConfigChangeArgs{
+			Config: c,
+		}
+		event := &Event{
+			Target:      args,
+			returnValue: nil,
+			c:           nil,
+		}
+		kv.eventCh <- event
+	}
+}
+
+func (kv *ShardKV) applyLoop() {
+	ticker := time.Tick(100 * time.Millisecond)
+	for {
+		select {
+		case <-kv.stopCh:
+			kv.setDead()
+			return
+		case <-ticker:
+			kv.updateConfig()
+		case msg := <-kv.applyCh:
+			kv.processApplyMsg(&msg)
+		}
+	}
+}
+
+func (kv *ShardKV) processConfigChangeArgs(a interface{}) {
+	args := a.(*ConfigChangeArgs)
+	config := args.Config
+	for shard, gid := range kv.config.Shards {
+		if gid == 0 || gid == args.Config.Shards[shard] {
+			continue
+		}
+		if kv.gid == gid && kv.gid != args.Config.Shards[shard] {
+			args := kv.makePushStateArgs(shard, &args.Config)
+			kv.push(args, config.Shards[shard], shard, &config)
+		}
+	}
+	kv.config = args.Config
+}
+
+func (kv *ShardKV) processApplyMsg(msg *raft.ApplyMsg) {
+	if msg.UseSnapshot {
+		kv.recovery(msg.Snapshot)
+	} else {
+		event := msg.Command.(*Event)
+		switch args := event.Target.(type) {
+		case *GetArgs:
+			kv.processGetArgs(args, event.returnValue)
+		case *PutAppendArgs:
+			kv.processPutAppendArgs(args, event.returnValue)
+		case *ConfigChangeArgs:
+			kv.processConfigChangeArgs(args)
+		case *PushStateArgs:
+			kv.shardManager.AddShard(args.Sn, args.Clock, args.Shard)
+		}
+		if event.c != nil {
+			event.c <- nil
+		}
+		if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate && kv.rf != nil {
+			data, _ := kv.save()
+			kv.rf.TakeSnapshot(data, msg.Index, msg.Term)
+		}
 	}
 }
 
@@ -150,50 +230,20 @@ func (kv *ShardKV) Alive() bool {
 }
 
 func (kv *ShardKV) PushState(args *PushStateArgs, reply *PushStateReply) {
-	op := Op{
-		ClientID:  args.ClientID,
-		Sequence:  args.Sequence,
-		Operation: "PushState",
-		c:         make(chan error, 1),
-	}
-	op.Database = make(map[string]string)
-	for key, value := range args.Database {
-		op.Database[key] = value
-	}
-	op.Done = make(map[string]int64)
-	for clientID, sequence := range args.Done {
-		op.Done[clientID] = sequence
-	}
-	if !kv.appendLog(op) {
-		reply.WrongLeader = true
-		return
-	}
-
-	reply.Err = OK
+	reply.WrongLeader = true
+	kv.send(args, reply)
 }
 
 func (kv *ShardKV) makePushStateArgs(shard int, config *shardmaster.Config) *PushStateArgs {
-	args := PushStateArgs{}
-	args.ClientID = kv.id
-	args.Sequence = kv.sequence
+	args := &PushStateArgs{
+		Sn:       shard,
+		Clock:    NewShardLogicalClock(kv.config.Num, kv.rf.Term()),
+		Shard:    kv.shardManager.GetShard(shard),
+		ClientID: kv.id,
+		Sequence: kv.sequence,
+	}
 	kv.sequence++
-	args.ConfigNum = config.Num
-	args.Shard = shard
-	kv.makeStateToPush(shard, &args)
-	return &args
-}
-
-func (kv *ShardKV) makeStateToPush(shard int, args *PushStateArgs) {
-	args.Database = make(map[string]string)
-	args.Done = make(map[string]int64)
-	for key, value := range kv.database {
-		if key2shard(key) == shard {
-			args.Database[key] = value
-		}
-	}
-	for clientID, sequence := range kv.done {
-		args.Done[clientID] = sequence
-	}
+	return args
 }
 
 func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardmaster.Config) bool {
@@ -208,110 +258,80 @@ func (kv *ShardKV) push(args *PushStateArgs, gid int, shard int, config *shardma
 			if ok && reply.Err == OK {
 				return true
 			}
+			if ok && reply.Clock.LaterThan(args.Clock) {
+				return false
+			}
 		}
 	}
 }
 
-func (kv *ShardKV) apply(cmd Op) {
-	switch cmd.Operation {
-	case "Put":
-		kv.database[cmd.Key] = cmd.Value
-	case "Append":
-		kv.database[cmd.Key] += cmd.Value
-	case "PushState":
-		for key, value := range cmd.Database {
-			kv.database[key] = value
-		}
-		for clientID, sequence := range cmd.Done {
-			if kv.done[clientID] < sequence {
-				kv.done[clientID] = sequence
+func (kv *ShardKV) send(value1 interface{}, value2 interface{}) error {
+	if !kv.Alive() {
+		return raft.StopError
+	}
+	event := &Event{
+		Target:      value1,
+		returnValue: value2,
+		c:           make(chan error, 1),
+	}
+	select {
+	case kv.eventCh <- event:
+	case <-kv.stopCh:
+		return raft.StopError
+	}
+	select {
+	case err := <-event.c:
+		return err
+	case <-kv.stopCh:
+		return raft.StopError
+	case <-time.After(1000 * time.Millisecond):
+		return raft.CommandTimeoutError
+	}
+}
+
+func (kv *ShardKV) eventLoop() {
+	for {
+		select {
+		case <-kv.stopCh:
+			kv.setDead()
+			return
+		case event := <-kv.eventCh:
+			switch args := event.Target.(type) {
+			case *PushStateArgs:
+				if !kv.shardManager.CanUpdateShard(args.Sn, args.Clock) {
+					reply := event.returnValue.(*PushStateReply)
+					reply.WrongLeader = false
+					reply.Err = ErrOldShard
+					reply.Sn = args.Sn
+					reply.Clock = kv.shardManager.GetClock(args.Sn)
+					event.c <- nil
+					continue
+				}
+			case *GetArgs:
+				sn := key2shard(args.Key)
+				if kv.gid != kv.config.Shards[sn] {
+					reply := event.returnValue.(*GetReply)
+					reply.WrongLeader = false
+					reply.Err = ErrWrongGroup
+					event.c <- nil
+					continue
+				}
+			case *PutAppendArgs:
+				sn := key2shard(args.Key)
+				if kv.gid != kv.config.Shards[sn] {
+					reply := event.returnValue.(*PutAppendReply)
+					reply.WrongLeader = false
+					reply.Err = ErrWrongGroup
+					event.c <- nil
+					continue
+				}
 			}
-		}
-	case "Reconfig":
-		for shard, gid := range kv.config.Shards {
-			if gid == 0 || gid == cmd.Config.Shards[shard] {
+			_, _, isLeader := kv.rf.Start(event)
+			if isLeader {
 				continue
 			}
-			if kv.gid == gid && kv.gid != cmd.Config.Shards[shard] {
-				args := kv.makePushStateArgs(shard, &cmd.Config)
-				kv.push(args, cmd.Config.Shards[shard], shard, &cmd.Config)
-			}
-		}
-		kv.config = cmd.Config
-	}
-	kv.done[cmd.ClientID] = cmd.Sequence
-}
-
-func (kv *ShardKV) applyLoop() {
-	for {
-		select {
-		case <-kv.stopCh:
-			kv.setDead()
-			return
-		case msg := <-kv.applyCh:
-			if msg.UseSnapshot {
-				var lastIncludedIndex int
-				var lastIncludedTerm int
-				buffer := bytes.NewBuffer(msg.Snapshot)
-				decoder := gob.NewDecoder(buffer)
-				decoder.Decode(&lastIncludedIndex)
-				decoder.Decode(&lastIncludedTerm)
-				database := make(map[string]string)
-				done := make(map[string]int64)
-				decoder.Decode(&database)
-				decoder.Decode(&done)
-				kv.mu.Lock()
-				kv.database = database
-				kv.done = done
-				kv.mu.Unlock()
-			} else {
-				op := msg.Command.(Op)
-				kv.mu.Lock()
-				if !kv.detectDuplicate(op.ClientID, op.Sequence) {
-					kv.apply(op)
-				}
-				if op.c != nil {
-					op.c <- nil
-				}
-				if kv.maxraftstate != -1 && kv.rf != nil && kv.rf.PersistStateSize() > kv.maxraftstate {
-					buffer := new(bytes.Buffer)
-					encoder := gob.NewEncoder(buffer)
-					encoder.Encode(kv.database)
-					encoder.Encode(kv.done)
-					data := buffer.Bytes()
-					go kv.rf.TakeSnapshot(data, msg.Index, msg.Term)
-				}
-				kv.mu.Unlock()
-			}
-		}
-	}
-}
-
-func (kv *ShardKV) configLoop() {
-	ticker := time.Tick(100 * time.Millisecond)
-	for {
-		select {
-		case <-kv.stopCh:
-			kv.setDead()
-			return
-		case <-ticker:
-			ck := shardmaster.MakeClerk(kv.masters)
-			config := ck.Query(-1)
-			kv.mu.Lock()
-			curNum := kv.config.Num
-			kv.mu.Unlock()
-			for n := curNum + 1; n <= config.Num; n++ {
-				c := ck.Query(n)
-				cmd := Op{
-					ClientID:  "Server.Reconfig",
-					Sequence:  int64(n),
-					Operation: "Reconfig",
-					Config:    c,
-					c:         make(chan error, 1),
-				}
-				if !kv.appendLog(cmd) {
-					break
-				}
+			if event.c != nil {
+				event.c <- raft.NotLeaderError
 			}
 		}
 	}
@@ -348,45 +368,46 @@ func (kv *ShardKV) configLoop() {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call gob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	gob.Register(Op{})
-
-	kv := new(ShardKV)
-	kv.me = me
-	//kv.maxraftstate = maxraftstate
-	kv.maxraftstate = -1
-	kv.make_end = make_end
-	kv.gid = gid
-	kv.masters = masters
+	gob.Register(&Shard{})
+	gob.Register(&Event{})
+	gob.Register(&GetArgs{})
+	gob.Register(&PutAppendArgs{})
+	gob.Register(&PushStateArgs{})
 
 	// Your initialization code here.
-	kv.done = make(map[string]int64)
-	kv.database = make(map[string]string)
-	kv.id, _ = newUUID()
-	kv.sequence = 0
-	atomic.StoreInt32(&kv.alive, 1)
-	kv.stopCh = make(chan bool)
+
+	shardkv := &ShardKV{
+		me:           me,
+		maxraftstate: maxraftstate,
+		make_end:     make_end,
+		masters:      masters,
+		gid:          gid,
+		id:           NewUUID(),
+		sequence:     0,
+		alive:        1,
+		shardManager: NewShardManager(),
+		stopCh:       make(chan bool),
+		eventCh:      make(chan *Event, 256),
+		applyCh:      make(chan raft.ApplyMsg, 256),
+		persister:    persister,
+	}
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
-	kv.applyCh = make(chan raft.ApplyMsg)
-	for i := 0; i < shardmaster.NShards; i++ {
-		kv.shardConfigNum[i] = 0
-	}
-
-	kv.routineGroup.Add(1)
+	shardkv.routineGroup.Add(1)
 	go func() {
-		defer kv.routineGroup.Done()
-		kv.applyLoop()
+		defer shardkv.routineGroup.Done()
+		shardkv.applyLoop()
 	}()
 
-	kv.routineGroup.Add(1)
+	shardkv.routineGroup.Add(1)
 	go func() {
-		defer kv.routineGroup.Done()
-		kv.configLoop()
+		defer shardkv.routineGroup.Done()
+		shardkv.eventLoop()
 	}()
 
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	shardkv.rf = raft.Make(servers, me, persister, shardkv.applyCh)
 
-	return kv
+	return shardkv
 }
